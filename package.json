@@ -4,7 +4,7 @@
   "type": "module",
   "engines": {
     "bb": ">=0.35",
-    "bbPluginSdk": "^0.4.1"
+    "bbPluginSdk": ">=0.4.4"
   },
   "bb": {
     "name": "SlopCop",
@@ -24,6 +24,7 @@
     "tailwind-merge": "^3.4.0"
   },
   "devDependencies": {
+    "@get-bb/plugin-sdk": "0.4.4",
     "@radix-ui/react-dialog": "^1.1.19",
     "@tailwindcss/node": "^4.3.3",
     "@tailwindcss/oxide": "^4.3.3",

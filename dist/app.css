@@ -151,9 +151,6 @@
     .relative {
       position: relative;
     }
-    .static {
-      position: static;
-    }
     .sticky {
       position: sticky;
     }
@@ -234,12 +231,6 @@
     }
     .ml-1\.5 {
       margin-left: calc(var(--spacing) * 1.5);
-    }
-    .block {
-      display: block;
-    }
-    .contents {
-      display: contents;
     }
     .flex {
       display: flex;
@@ -755,9 +746,6 @@
     .capitalize {
       text-transform: capitalize;
     }
-    .lowercase {
-      text-transform: lowercase;
-    }
     .underline-offset-4 {
       text-underline-offset: 4px;
     }
@@ -832,9 +820,6 @@
     .select-none {
       -webkit-user-select: none;
       user-select: none;
-    }
-    .paused {
-      animation-play-state: paused;
     }
     .running {
       animation-play-state: running;

@@ -102,10 +102,10 @@ var {
   version
 } = mod;
 
-// bb-plugin-runtime-shim:@bb/plugin-sdk/app
+// bb-plugin-runtime-shim:@get-bb/plugin-sdk/app
 var runtime2 = globalThis.__bbPluginRuntime;
 if (runtime2 == null || runtime2.pluginSdkApp == null) {
-  throw new Error('Cannot load "@bb/plugin-sdk/app": this bundle must be loaded by the BB app, which provides the shared plugin runtime (globalThis.__bbPluginRuntime).');
+  throw new Error('Cannot load "@get-bb/plugin-sdk/app": this bundle must be loaded by the BB app, which provides the shared plugin runtime (globalThis.__bbPluginRuntime).');
 }
 var mod2 = runtime2.pluginSdkApp;
 var {
@@ -113,6 +113,10 @@ var {
   ThreadChat,
   definePluginApp,
   experimental_NewThreadComposer,
+  experimental_useSidebarThreadActions,
+  experimental_useSidebarThreadPullRequest,
+  experimental_useSidebarThreadSplit,
+  experimental_useSidebarThreads,
   useBbContext,
   useBbNavigate,
   useComposer,
@@ -135,7 +139,7 @@ var {
   useSonner
 } = mod3;
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/node_modules/@radix-ui/react-compose-refs/dist/index.mjs
+// ../bb-slop-cop/node_modules/@radix-ui/react-compose-refs/dist/index.mjs
 var __defProp2 = Object.defineProperty;
 var __name = (target, value) => __defProp2(target, "name", { value, configurable: true });
 function setRef(ref, value) {
@@ -176,7 +180,7 @@ function useComposedRefs(...refs) {
 }
 __name(useComposedRefs, "useComposedRefs");
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/node_modules/@radix-ui/react-slot/dist/index.mjs
+// ../bb-slop-cop/node_modules/@radix-ui/react-slot/dist/index.mjs
 var __defProp3 = Object.defineProperty;
 var __name2 = (target, value) => __defProp3(target, "name", { value, configurable: true });
 // @__NO_SIDE_EFFECTS__
@@ -312,7 +316,7 @@ var createSlottableError = /* @__PURE__ */ __name2((ownerName) => {
 }, "createSlottableError");
 var use2 = react_exports[" use ".trim().toString()];
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/node_modules/clsx/dist/clsx.mjs
+// ../bb-slop-cop/node_modules/clsx/dist/clsx.mjs
 function r(e) {
   var t, f, n = "";
   if ("string" == typeof e || "number" == typeof e) n += e;
@@ -327,7 +331,7 @@ function clsx() {
   return n;
 }
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/node_modules/class-variance-authority/dist/index.mjs
+// ../bb-slop-cop/node_modules/class-variance-authority/dist/index.mjs
 var falsyToString = (value) => typeof value === "boolean" ? `${value}` : value === 0 ? "0" : value;
 var cx = clsx;
 var cva = (base, config) => (props) => {
@@ -369,7 +373,7 @@ var cva = (base, config) => (props) => {
   return cx(base, getVariantClassNames, getCompoundVariantClassNames, props === null || props === void 0 ? void 0 : props.class, props === null || props === void 0 ? void 0 : props.className);
 };
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/node_modules/tailwind-merge/dist/bundle-mjs.mjs
+// ../bb-slop-cop/node_modules/tailwind-merge/dist/bundle-mjs.mjs
 var concatArrays = (array1, array2) => {
   const combinedArray = new Array(array1.length + array2.length);
   for (let i = 0; i < array1.length; i++) {
@@ -3623,12 +3627,12 @@ var getDefaultConfig = () => {
 };
 var twMerge = /* @__PURE__ */ createTailwindMerge(getDefaultConfig);
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/lib/utils.ts
+// ../bb-slop-cop/lib/utils.ts
 function cn(...inputs) {
   return twMerge(clsx(inputs));
 }
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/components/ui/motion.ts
+// ../bb-slop-cop/components/ui/motion.ts
 var CONTROL_HOVER_TRANSITION = "transition-colors duration-150 hover:duration-0";
 
 // bb-plugin-runtime-shim:react/jsx-runtime
@@ -3643,7 +3647,7 @@ var {
   jsxs
 } = mod4;
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/components/ui/button.tsx
+// ../bb-slop-cop/components/ui/button.tsx
 var buttonVariants = cva(
   `inline-flex cursor-pointer items-center justify-center gap-2 whitespace-nowrap rounded-md text-sm font-medium ${CONTROL_HOVER_TRANSITION} focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:size-4 [&_svg]:shrink-0`,
   {
@@ -3684,14 +3688,14 @@ var Button = forwardRef(
 );
 Button.displayName = "Button";
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/components/ui/coarse-pointer-sizing.ts
+// ../bb-slop-cop/components/ui/coarse-pointer-sizing.ts
 var COARSE_POINTER_TEXT_BASE_CLASS = "text-sm max-md:pointer-coarse:text-base";
 var HEADER_ICON_BUTTON_BOX_CLASS = "h-[28px] w-[28px] rounded-md p-0 max-md:pointer-coarse:h-[36px] max-md:pointer-coarse:w-[36px]";
 var COARSE_POINTER_HEADER_ICON_BUTTON_CLASS = `${HEADER_ICON_BUTTON_BOX_CLASS} [&_svg]:size-[16px] max-md:pointer-coarse:[&_svg]:size-[20px]`;
 var COARSE_POINTER_HEADER_REDUCED_GLYPH_ICON_BUTTON_CLASS = `${HEADER_ICON_BUTTON_BOX_CLASS} [&_svg]:size-[13px] max-md:pointer-coarse:[&_svg]:size-[16px]`;
 var COARSE_POINTER_INPUT_HEIGHT_CLASS = "h-9 max-md:pointer-coarse:h-10";
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/components/ui/input.tsx
+// ../bb-slop-cop/components/ui/input.tsx
 var Input = forwardRef(
   ({ className, type, ...props }, ref) => {
     return /* @__PURE__ */ jsx(
@@ -3713,7 +3717,7 @@ var Input = forwardRef(
 );
 Input.displayName = "Input";
 
-// ../../.bb/personal-workspaces/env_9mauuy7d9r/bb-plugin-slopcop/app.tsx
+// ../bb-slop-cop/app.tsx
 var TRUST_LABEL = {
   write_access: "trusted authors only",
   past_contributors: "+ past contributors",
