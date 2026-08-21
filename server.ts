@@ -19,6 +19,12 @@ import {
 } from "./lib/matcher";
 import { verifyLive, verifyShadow } from "./lib/verify";
 import {
+  completeCheckRun,
+  startCheckRun,
+  type CompleteCheckInput,
+} from "./lib/checks";
+import type { Run } from "./lib/types";
+import {
   authorTrustSchema,
   conditionSchema,
   dedupeSchema,
@@ -230,6 +236,44 @@ export default async function plugin(bb: BbPluginApi) {
   };
 
   /**
+   * Best-effort GitHub Check. Live reviews only; a 403 (app missing Checks
+   * write) or any other API error is logged and ignored so the comment still
+   * lands.
+   */
+  async function reportCheck(
+    kind: "start" | "complete",
+    run: Pick<
+      Run,
+      "id" | "repo" | "headSha" | "ruleName" | "prNumber" | "mode"
+    >,
+    complete?: Pick<CompleteCheckInput, "status" | "commentCount" | "detail">,
+  ): Promise<void> {
+    if (run.mode !== "live" || run.headSha.length === 0) return;
+    const request = gh.request.bind(gh);
+    const base = {
+      repo: run.repo,
+      sha: run.headSha,
+      runId: run.id,
+      ruleName: run.ruleName,
+      prNumber: run.prNumber,
+    };
+    try {
+      if (kind === "start") {
+        await startCheckRun(request, base);
+        return;
+      }
+      if (complete === undefined) return;
+      await completeCheckRun(request, { ...base, ...complete });
+    } catch (error) {
+      bb.log.warn(
+        `check run ${kind} failed for ${run.repo}#${run.prNumber}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
+
+  /**
    * REST does not return a PR's changed files inline, so they are fetched only
    * when a rule actually filters on paths — which keeps the common poll pass to
    * a single API call per repo.
@@ -349,6 +393,16 @@ export default async function plugin(bb: BbPluginApi) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
       );
+      if (rule.mode === "live") {
+        await reportCheck("start", {
+          id: runId,
+          repo: rule.repo,
+          headSha: pullRequest.headRefOid,
+          ruleName: rule.name,
+          prNumber: pullRequest.number,
+          mode: rule.mode,
+        });
+      }
       return { runId, threadId };
     } catch (error) {
       store.updateRun(runId, {
@@ -486,6 +540,11 @@ export default async function plugin(bb: BbPluginApi) {
         finishedAt: Date.now(),
       });
       announce();
+      await reportCheck("complete", run, {
+        status: "failed",
+        commentCount: 0,
+        detail: failure,
+      });
       return;
     }
 
@@ -519,6 +578,11 @@ export default async function plugin(bb: BbPluginApi) {
       finishedAt: Date.now(),
     });
     announce();
+    await reportCheck("complete", run, {
+      status: result.status,
+      commentCount: result.comments.length,
+      detail: result.detail,
+    });
     bb.log.info(
       `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
     );
@@ -1000,6 +1064,11 @@ export default async function plugin(bb: BbPluginApi) {
             commentCount: result.comments.length,
           });
           announce();
+          await reportCheck("complete", run, {
+            status: result.status,
+            commentCount: result.comments.length,
+            detail: result.detail,
+          });
           return ok(
             json
               ? JSON.stringify(result, null, 2)

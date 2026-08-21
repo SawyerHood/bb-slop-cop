@@ -87,3 +87,8 @@ matched nothing, e.g. blocked by the trust gate) · `failed`.
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
 rather than trusting the agent's transcript.
+
+Live runs also open a GitHub Check named `SlopCop` on the head SHA (in progress
+while the thread runs, then completed from verified comment state). That is the
+merge-box row next to CI. Shadow runs never open a check. A missing Checks
+permission on the GitHub App is non-fatal — comments still post.

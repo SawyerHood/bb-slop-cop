@@ -14528,7 +14528,7 @@ function date4(params) {
 config(en_default());
 
 // lib/gh.ts
-import { execFile } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 var GhError = class extends Error {
   constructor(message, stderr) {
     super(message);
@@ -14537,6 +14537,12 @@ var GhError = class extends Error {
   }
   stderr;
 };
+function failFrom(args, stderr, fallback) {
+  return new GhError(
+    `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || fallback}`,
+    stderr
+  );
+}
 function run(file2, args, timeoutMs) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -14545,17 +14551,55 @@ function run(file2, args, timeoutMs) {
       { timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
       (error51, stdout, stderr) => {
         if (error51) {
-          reject(
-            new GhError(
-              `gh ${args.slice(0, 3).join(" ")} failed: ${stderr.trim() || error51.message}`,
-              stderr
-            )
-          );
+          reject(failFrom(args, stderr, error51.message));
           return;
         }
         resolve(stdout);
       }
     );
+  });
+}
+function runWithStdin(file2, args, timeoutMs, stdin) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(file2, args, { stdio: ["pipe", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      if (!settled) {
+        settled = true;
+        reject(failFrom(args, stderr, "timed out"));
+      }
+    }, timeoutMs);
+    const finish = (error51) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error51) {
+        reject(error51);
+        return;
+      }
+      resolve(stdout);
+    };
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", (error51) => {
+      finish(failFrom(args, stderr, error51.message));
+    });
+    child.on("close", (code) => {
+      if (code === 0) {
+        finish(null);
+        return;
+      }
+      finish(failFrom(args, stderr, `exit ${code ?? "null"}`));
+    });
+    child.stdin.write(stdin);
+    child.stdin.end();
   });
 }
 function toTimestamp(value) {
@@ -14655,6 +14699,17 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
           return null;
         }
       }
+    },
+    async request(method, endpoint, body) {
+      const args = ["api", "--method", method, endpoint];
+      const stdout = body === void 0 ? await run(ghPath, args, timeoutMs) : await runWithStdin(
+        ghPath,
+        [...args, "--input", "-"],
+        timeoutMs,
+        JSON.stringify(body)
+      );
+      const trimmed = stdout.trim();
+      return trimmed.length === 0 ? null : JSON.parse(trimmed);
     }
   };
 }
@@ -15502,6 +15557,137 @@ function verifyShadow(options) {
   };
 }
 
+// lib/checks.ts
+var CHECK_NAME = "SlopCop";
+function asRecord2(value) {
+  return typeof value === "object" && value !== null ? value : {};
+}
+function prUrl(repo, prNumber) {
+  return `https://github.com/${repo}/pull/${prNumber}`;
+}
+function conclusionFor(status) {
+  switch (status) {
+    case "commented":
+    case "commented_partial":
+    case "commented_unmarked":
+      return "success";
+    case "no_comment":
+    case "commented_unattributed":
+      return "neutral";
+    case "failed":
+      return "failure";
+    case "skipped":
+    case "shadowed":
+    case "dispatched":
+    case "reviewing":
+      return null;
+  }
+}
+function outputFor(input) {
+  const { status, ruleName, prNumber, commentCount, detail } = input;
+  const extra = detail !== null && detail.length > 0 ? `
+
+${detail}` : "";
+  switch (status) {
+    case "commented":
+      return {
+        title: "Review posted",
+        summary: `SlopCop finished \`${ruleName}\` on PR #${prNumber} and posted ${commentCount} comment(s).${extra}`
+      };
+    case "commented_partial":
+    case "commented_unmarked":
+      return {
+        title: "Review posted with attribution drift",
+        summary: `SlopCop posted on PR #${prNumber}, but some comments were missing the required marker.${extra}`
+      };
+    case "no_comment":
+      return {
+        title: "Review finished without a comment",
+        summary: `SlopCop ran \`${ruleName}\` on PR #${prNumber} but posted nothing.${extra}`
+      };
+    case "commented_unattributed":
+      return {
+        title: "Review not attributable",
+        summary: `A comment landed on PR #${prNumber} but could not be proven as SlopCop's.${extra}`
+      };
+    case "failed":
+      return {
+        title: "Review failed",
+        summary: `SlopCop failed while reviewing PR #${prNumber} with \`${ruleName}\`.${extra}`
+      };
+    default:
+      return {
+        title: "SlopCop",
+        summary: `Rule \`${ruleName}\` on PR #${prNumber}: ${status}.${extra}`
+      };
+  }
+}
+function checkId(value) {
+  const id = asRecord2(value).id;
+  return typeof id === "number" ? id : null;
+}
+async function findCheckRunId(request, input) {
+  const payload = await request(
+    "GET",
+    `repos/${input.repo}/commits/${input.sha}/check-runs?check_name=${encodeURIComponent(CHECK_NAME)}`
+  );
+  const rows = asRecord2(payload).check_runs;
+  if (!Array.isArray(rows)) return null;
+  const ours = rows.filter(
+    (row) => asRecord2(row).external_id === input.runId
+  );
+  const inProgress = ours.find(
+    (row) => asRecord2(row).status === "in_progress"
+  );
+  return checkId(inProgress ?? ours[0] ?? null);
+}
+async function startCheckRun(request, input) {
+  const created = await request(
+    "POST",
+    `repos/${input.repo}/check-runs`,
+    {
+      name: CHECK_NAME,
+      head_sha: input.sha,
+      status: "in_progress",
+      external_id: input.runId,
+      details_url: prUrl(input.repo, input.prNumber),
+      started_at: (/* @__PURE__ */ new Date()).toISOString(),
+      output: {
+        title: "Reviewing",
+        summary: `SlopCop is running \`${input.ruleName}\` on PR #${input.prNumber}.`
+      }
+    }
+  );
+  return checkId(created);
+}
+async function completeCheckRun(request, input) {
+  const conclusion = conclusionFor(input.status);
+  if (conclusion === null) return;
+  const body = {
+    name: CHECK_NAME,
+    status: "completed",
+    conclusion,
+    completed_at: (/* @__PURE__ */ new Date()).toISOString(),
+    details_url: prUrl(input.repo, input.prNumber),
+    output: outputFor(input)
+  };
+  const existing = await findCheckRunId(request, input);
+  if (existing !== null) {
+    await request(
+      "PATCH",
+      `repos/${input.repo}/check-runs/${existing}`,
+      body
+    );
+    return;
+  }
+  await request("POST", `repos/${input.repo}/check-runs`, {
+    ...body,
+    head_sha: input.sha,
+    external_id: input.runId,
+    started_at: (/* @__PURE__ */ new Date()).toISOString()
+  });
+}
+
 // server.ts
 var RUNS_CHANNEL = "runs-changed";
 var ruleInputSchema = external_exports.object({
@@ -15684,6 +15870,29 @@ async function plugin(bb) {
   const announce = () => {
     bb.realtime.publish(RUNS_CHANNEL, { at: Date.now() });
   };
+  async function reportCheck(kind, run2, complete) {
+    if (run2.mode !== "live" || run2.headSha.length === 0) return;
+    const request = gh.request.bind(gh);
+    const base = {
+      repo: run2.repo,
+      sha: run2.headSha,
+      runId: run2.id,
+      ruleName: run2.ruleName,
+      prNumber: run2.prNumber
+    };
+    try {
+      if (kind === "start") {
+        await startCheckRun(request, base);
+        return;
+      }
+      if (complete === void 0) return;
+      await completeCheckRun(request, { ...base, ...complete });
+    } catch (error51) {
+      bb.log.warn(
+        `check run ${kind} failed for ${run2.repo}#${run2.prNumber}: ${error51 instanceof Error ? error51.message : String(error51)}`
+      );
+    }
+  }
   async function hydrateFiles(rules, repo, pullRequest) {
     const needsFiles = rules.some(
       (rule) => rule.conditions.some((condition) => condition.kind === "paths")
@@ -15763,6 +15972,16 @@ async function plugin(bb) {
       bb.log.info(
         `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`
       );
+      if (rule.mode === "live") {
+        await reportCheck("start", {
+          id: runId,
+          repo: rule.repo,
+          headSha: pullRequest.headRefOid,
+          ruleName: rule.name,
+          prNumber: pullRequest.number,
+          mode: rule.mode
+        });
+      }
       return { runId, threadId };
     } catch (error51) {
       store.updateRun(runId, {
@@ -15871,6 +16090,11 @@ async function plugin(bb) {
         finishedAt: Date.now()
       });
       announce();
+      await reportCheck("complete", run2, {
+        status: "failed",
+        commentCount: 0,
+        detail: failure
+      });
       return;
     }
     const runVerify = () => verifyLive({
@@ -15895,6 +16119,11 @@ async function plugin(bb) {
       finishedAt: Date.now()
     });
     announce();
+    await reportCheck("complete", run2, {
+      status: result.status,
+      commentCount: result.comments.length,
+      detail: result.detail
+    });
     bb.log.info(
       `run ${run2.id} (${run2.ruleName} #${run2.prNumber}) -> ${result.status}`
     );
@@ -16262,6 +16491,11 @@ ${payload.rules} rule(s)`
             commentCount: result.comments.length
           });
           announce();
+          await reportCheck("complete", run2, {
+            status: result.status,
+            commentCount: result.comments.length,
+            detail: result.detail
+          });
           return ok(
             json2 ? JSON.stringify(result, null, 2) : `${run2.id}: ${result.status} (${result.comments.length} comment(s))${result.detail === null ? "" : `
 ${result.detail}`}`

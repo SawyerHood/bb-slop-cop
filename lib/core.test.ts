@@ -16,7 +16,15 @@ import {
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
 import { verifyLive, verifyShadow } from "./verify";
+import {
+  CHECK_NAME,
+  completeCheckRun,
+  conclusionFor,
+  outputFor,
+  startCheckRun,
+} from "./checks";
 import type { GhClient, GhComment } from "./gh";
+import type { RunStatus } from "./types";
 import type { PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
 import { expandHome } from "./paths";
@@ -407,6 +415,7 @@ function fakeGh(parts: {
     listReviewComments: async () => parts.review ?? [],
     listReviews: async () => parts.reviews ?? [],
     authenticatedLogin: async () => "octocat",
+    request: async () => null,
   };
 }
 
@@ -541,5 +550,112 @@ describe("shadow verification", () => {
     expect(verifyShadow({ runId: "run_1", finalMessage: null }).status).toBe(
       "no_comment",
     );
+  });
+});
+
+describe("github checks", () => {
+  it("treats a posted review as success so it does not fail merges", () => {
+    const posted: RunStatus[] = [
+      "commented",
+      "commented_partial",
+      "commented_unmarked",
+    ];
+    for (const status of posted) {
+      expect(conclusionFor(status)).toBe("success");
+    }
+  });
+
+  it("does not open or complete a check for shadow or in-flight runs", () => {
+    expect(conclusionFor("shadowed")).toBeNull();
+    expect(conclusionFor("reviewing")).toBeNull();
+    expect(conclusionFor("dispatched")).toBeNull();
+  });
+
+  it("uses the same check name GitHub groups in the merge box", () => {
+    expect(CHECK_NAME).toBe("SlopCop");
+  });
+
+  it("creates an in_progress check and later completes the same run", async () => {
+    const calls: { method: string; endpoint: string; body: unknown }[] = [];
+    const request: GhClient["request"] = async (method, endpoint, body) => {
+      calls.push({ method, endpoint, body });
+      if (method === "POST") return { id: 99 };
+      if (method === "GET") {
+        return {
+          check_runs: [
+            { id: 99, external_id: "run_1", status: "in_progress" },
+          ],
+        };
+      }
+      return { id: 99 };
+    };
+
+    await startCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+    });
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "a1b2c3d",
+      runId: "run_1",
+      ruleName: "security-sweep",
+      prNumber: 482,
+      status: "commented",
+      commentCount: 2,
+      detail: null,
+    });
+
+    expect(calls[0]?.method).toBe("POST");
+    expect(calls[0]?.endpoint).toBe("repos/acme/checkout-api/check-runs");
+    expect(calls[0]?.body).toMatchObject({
+      name: "SlopCop",
+      head_sha: "a1b2c3d",
+      status: "in_progress",
+      external_id: "run_1",
+    });
+    expect(calls[2]?.method).toBe("PATCH");
+    expect(calls[2]?.endpoint).toBe("repos/acme/checkout-api/check-runs/99");
+    expect(calls[2]?.body).toMatchObject({
+      status: "completed",
+      conclusion: "success",
+    });
+  });
+
+  it("posts a completed check when no in-progress run exists to patch", async () => {
+    const calls: { method: string; endpoint: string; body: unknown }[] = [];
+    const request: GhClient["request"] = async (method, endpoint, body) => {
+      calls.push({ method, endpoint, body });
+      if (method === "GET") return { check_runs: [] };
+      return { id: 7 };
+    };
+    await completeCheckRun(request, {
+      repo: "acme/checkout-api",
+      sha: "deadbeef",
+      runId: "run_9",
+      ruleName: "security-sweep",
+      prNumber: 1,
+      status: "failed",
+      commentCount: 0,
+      detail: "thread crashed",
+    });
+    expect(calls.at(-1)?.method).toBe("POST");
+    expect(calls.at(-1)?.body).toMatchObject({
+      head_sha: "deadbeef",
+      conclusion: "failure",
+      external_id: "run_9",
+    });
+    expect(outputFor({
+      repo: "acme/checkout-api",
+      sha: "deadbeef",
+      runId: "run_9",
+      ruleName: "security-sweep",
+      prNumber: 1,
+      status: "failed",
+      commentCount: 0,
+      detail: "thread crashed",
+    }).title).toBe("Review failed");
   });
 });
