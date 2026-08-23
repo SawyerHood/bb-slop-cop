@@ -57,6 +57,11 @@ export function parseMarker(body: string): Marker | null {
   return { rule, run, sha: fields.get("sha") ?? "", kind };
 }
 
+/** True when this marker belongs to `ruleName` (after the same sanitizing). */
+export function markerBelongsToRule(marker: Marker, ruleName: string): boolean {
+  return marker.rule === sanitize(ruleName);
+}
+
 /**
  * The summary gets the full banner; inline comments and replies get a compact
  * one-liner. A full banner on each of six inline comments buries the finding

@@ -33,7 +33,7 @@ bb slopcop rules add \
   --repo owner/repo \
   --project my-project \
   --paths "src/auth/**,src/payments/**" \
-  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
 
 bb slopcop check security-sweep 482   # would it match? if not, exactly why not
 bb slopcop dispatch security-sweep 482
@@ -75,12 +75,14 @@ Every posted body carries a visible header so humans know it is a bot and which 
 wrote it, plus a hidden marker so SlopCop can find its own comments later:
 
 ```markdown
-🚨 **SLOP COP** 🚨 · `security-sweep`
+🚨 `slopcop/security-sweep` — this compare is unauthenticated
 
-Three findings, one blocking…
-
-<!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=summary -->
+<!-- slopcop:rule=security-sweep run=run_01J7X sha=a1b2c3d kind=inline -->
 ```
+
+Findings are line comments on the diff. A Conversation review body is only for
+the no-findings case (`kind=summary`). A later run on a new commit is told
+which comments this rule already left, so it should not open a twin thread.
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
 polls GitHub's three separate comment surfaces (issue comments, inline review comments,

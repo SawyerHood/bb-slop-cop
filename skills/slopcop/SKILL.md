@@ -37,7 +37,7 @@ bb slopcop rules add \
   --model claude-opus-5 \
   --paths "src/auth/**,src/payments/**" \
   --base main \
-  --prompt "Review the diff for auth and payment issues. Post findings with gh pr review --comment."
+  --prompt "Review the diff for auth and payment issues. Post each finding as a line comment on the diff."
 ```
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
@@ -86,4 +86,7 @@ matched nothing, e.g. blocked by the trust gate) · `failed`.
 
 Every comment SlopCop posts carries a visible `🚨 SLOP COP 🚨` header and a
 hidden `<!-- slopcop:… -->` marker; verification polls GitHub for that marker
-rather than trusting the agent's transcript.
+rather than trusting the agent's transcript. Later runs on the same PR are
+given this rule's existing comments and told not to post the same finding
+again. GitHub line comments are a title plus two sentences, not the full
+review memo.

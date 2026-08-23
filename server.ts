@@ -9,6 +9,7 @@ import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
+import { collectPriorComments } from "./lib/prior";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
 import {
@@ -301,7 +302,31 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const { botGhPath, defaultThreadSection } = await readSettings();
-    const context = { rule, pullRequest, runId, ghCommand: botGhPath };
+    let priorComments: ReturnType<typeof collectPriorComments> = [];
+    try {
+      const [issues, review, reviews] = await Promise.all([
+        gh.listIssueComments(rule.repo, pullRequest.number),
+        gh.listReviewComments(rule.repo, pullRequest.number),
+        gh.listReviews(rule.repo, pullRequest.number),
+      ]);
+      priorComments = collectPriorComments(
+        [...issues, ...review, ...reviews],
+        rule.name,
+      );
+    } catch (error) {
+      bb.log.warn(
+        `could not list prior comments for ${rule.repo}#${pullRequest.number}: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+    const context = {
+      rule,
+      pullRequest,
+      runId,
+      ghCommand: botGhPath,
+      priorComments,
+    };
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
       // `input`, so it must be dropped here — the prompt SlopCop builds from
