@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import Database from "better-sqlite3";
 import {
   attributeBody,
   buildMarker,
@@ -9,17 +10,20 @@ import {
 import {
   computeTriggers,
   evaluateRule,
+  findMatchingKeyword,
   isDangerousCombination,
   isSevereCombination,
   isTrustedAuthor,
   matchGlob,
+  matchesPrDescription,
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
 import { verifyLive, verifyShadow } from "./verify";
-import type { GhClient, GhComment } from "./gh";
+import { toPullRequest, type GhClient, type GhComment } from "./gh";
 import type { PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
 import { expandHome } from "./paths";
+import { createStore, MIGRATIONS } from "./db";
 
 function makeRule(overrides: Partial<Rule> = {}): Rule {
   return {
@@ -29,8 +33,11 @@ function makeRule(overrides: Partial<Rule> = {}): Rule {
     enabled: true,
     mode: "shadow",
     triggers: ["ready_for_review"],
+    commentKeywords: [],
     conditions: [],
     authorTrust: "write_access",
+    requesterTrust: "write_access",
+    commentTriggerEnabledAt: null,
     prompt: "Review it.",
     request: null,
     dedupe: "once_per_pr",
@@ -46,6 +53,8 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
   return {
     number: 482,
     title: "Rotate webhook signing secrets",
+    body: "Please review this change.",
+    createdAt: 2_000,
     isDraft: false,
     headRefOid: "a1b2c3d",
     baseRefName: "main",
@@ -58,6 +67,63 @@ function makePr(overrides: Partial<PullRequest> = {}): PullRequest {
     ...overrides,
   };
 }
+
+describe("comment trigger storage", () => {
+  it("migrates, saves trigger rules, and keeps pending comment events", () => {
+    const database = new Database(":memory:");
+    for (const migration of MIGRATIONS) database.exec(migration);
+    const store = createStore(database as never);
+    const rule = makeRule({
+      triggers: ["comment_matches", "pr_description_matches"],
+      commentKeywords: ["@slopcop"],
+      commentTriggerEnabledAt: 1_000,
+      dedupe: "once_per_trigger_event",
+    });
+    store.upsertRule(rule);
+    expect(store.getRule(rule.id)).toMatchObject({
+      commentKeywords: ["@slopcop"],
+      requesterTrust: "write_access",
+      commentTriggerEnabledAt: 1_000,
+    });
+
+    store.enqueueCommentEvent({
+      ruleId: rule.id,
+      source: "issue",
+      commentId: "42",
+      repo: rule.repo,
+      prNumber: 482,
+      author: "dana",
+      authorAssociation: "MEMBER",
+      matchedKeyword: "@slopcop",
+      url: "https://github.com/acme/checkout-api/pull/482#issuecomment-42",
+      createdAt: 2_000,
+      status: "pending",
+      detail: null,
+    });
+    expect(store.listPendingCommentEvents(rule.repo)).toHaveLength(1);
+    store.finishCommentEvent(rule.id, "issue", "42", "processed", null);
+    expect(store.listPendingCommentEvents(rule.repo)).toHaveLength(0);
+    database.close();
+  });
+});
+
+describe("GitHub PR mapping", () => {
+  it("keeps the description and creation time for initial keyword checks", () => {
+    const pullRequest = toPullRequest({
+      number: 7,
+      title: "Requested review",
+      body: "Please run @slopcop",
+      created_at: "2026-08-27T12:00:00Z",
+      head: { sha: "abc", repo: { full_name: "acme/repo" } },
+      base: { ref: "main", repo: { full_name: "acme/repo" } },
+      user: { login: "dana" },
+      author_association: "MEMBER",
+      labels: [],
+    });
+    expect(pullRequest.body).toBe("Please run @slopcop");
+    expect(pullRequest.createdAt).toBe(Date.parse("2026-08-27T12:00:00Z"));
+  });
+});
 
 describe("thread sections", () => {
   const sections = [
@@ -235,7 +301,10 @@ describe("author trust", () => {
   it("blocks an untrusted author and says why", () => {
     const result = evaluateRule(
       makeRule(),
-      makePr({ authorAssociation: "FIRST_TIME_CONTRIBUTOR", author: { login: "randal" } }),
+      makePr({
+        authorAssociation: "FIRST_TIME_CONTRIBUTOR",
+        author: { login: "randal" },
+      }),
       "ready_for_review",
     );
     expect(result).toMatchObject({ matched: false, blockedByTrust: true });
@@ -282,7 +351,13 @@ describe("author trust", () => {
 });
 
 describe("trigger detection", () => {
-  const base = { isDraft: false, headSha: "sha1", repoBootstrapped: true };
+  const base = {
+    isDraft: false,
+    headSha: "sha1",
+    repoBootstrapped: true,
+    createdAt: 7_000,
+    watchStartedAt: 5_000,
+  };
 
   it("fires on a PR opened directly as ready-for-review", () => {
     // The regression that silently ignored most PRs: unseen + already watching
@@ -294,8 +369,19 @@ describe("trigger detection", () => {
 
   it("does not fire on the backlog during the first pass over a repo", () => {
     expect(
-      computeTriggers({ ...base, seen: null, repoBootstrapped: false }),
+      computeTriggers({
+        ...base,
+        seen: null,
+        repoBootstrapped: false,
+        createdAt: 2_000,
+      }),
     ).toEqual([]);
+  });
+
+  it("fires for a PR posted after a rule but before the first poll", () => {
+    expect(
+      computeTriggers({ ...base, seen: null, repoBootstrapped: false }),
+    ).toEqual(["ready_for_review"]);
   });
 
   it("fires when a draft is marked ready", () => {
@@ -323,9 +409,7 @@ describe("trigger detection", () => {
   });
 
   it("never fires for a draft", () => {
-    expect(
-      computeTriggers({ ...base, isDraft: true, seen: null }),
-    ).toEqual([]);
+    expect(computeTriggers({ ...base, isDraft: true, seen: null })).toEqual([]);
     expect(
       computeTriggers({
         ...base,
@@ -333,6 +417,35 @@ describe("trigger detection", () => {
         seen: { headSha: "old", wasDraft: false },
       }),
     ).toEqual([]);
+  });
+});
+
+describe("comment keyword matching", () => {
+  it("matches mentions and phrases without case sensitivity", () => {
+    expect(findMatchingKeyword("Please @SlopCop review", ["@slopcop"])).toBe(
+      "@slopcop",
+    );
+    expect(findMatchingKeyword("Run SLOP CHECK now", ["slop check"])).toBe(
+      "slop check",
+    );
+  });
+
+  it("requires complete token boundaries", () => {
+    expect(findMatchingKeyword("ping @slopcop-test", ["@slopcop"])).toBeNull();
+    expect(findMatchingKeyword("run slop checker", ["slop check"])).toBeNull();
+  });
+
+  it("matches a configured keyword in a new PR description", () => {
+    const rule = makeRule({
+      triggers: ["pr_description_matches"],
+      commentKeywords: ["@slopcop"],
+    });
+    expect(
+      matchesPrDescription(rule, makePr({ body: "Please ask @slopcop." })),
+    ).toBe(true);
+    expect(matchesPrDescription(rule, makePr({ body: "Normal PR" }))).toBe(
+      false,
+    );
   });
 });
 
@@ -360,7 +473,9 @@ describe("conditions", () => {
     const rule = makeRule({
       conditions: [{ kind: "title_matches", regex: "([unclosed" }],
     });
-    expect(evaluateRule(rule, makePr(), "ready_for_review").matched).toBe(false);
+    expect(evaluateRule(rule, makePr(), "ready_for_review").matched).toBe(
+      false,
+    );
   });
 
   it("skips drafts and disabled rules", () => {
@@ -378,6 +493,22 @@ describe("conditions", () => {
     const rule = makeRule({ triggers: ["ready_for_review"] });
     expect(evaluateRule(rule, makePr(), "new_commits").matched).toBe(false);
     expect(evaluateRule(rule, makePr(), "manual").matched).toBe(true);
+  });
+
+  it("lets a trusted commenter request review on another person's PR", () => {
+    const rule = makeRule({ triggers: ["comment_matches"] });
+    const outsideAuthor = makePr({
+      author: { login: "external-author" },
+      authorAssociation: "NONE",
+    });
+    expect(evaluateRule(rule, outsideAuthor, "comment_matches").matched).toBe(
+      false,
+    );
+    expect(
+      evaluateRule(rule, outsideAuthor, "comment_matches", {
+        skipAuthorTrust: true,
+      }).matched,
+    ).toBe(true);
   });
 });
 
@@ -406,6 +537,8 @@ function fakeGh(parts: {
     listIssueComments: async () => parts.issues ?? [],
     listReviewComments: async () => parts.review ?? [],
     listReviews: async () => parts.reviews ?? [],
+    listRecentIssueComments: async () => [],
+    listRecentReviewComments: async () => [],
     authenticatedLogin: async () => "octocat",
   };
 }
@@ -433,7 +566,12 @@ describe("live verification", () => {
       gh: fakeGh({
         issues: [ghComment({ id: "a", body: marked("summary") })],
         review: [
-          ghComment({ id: "b", body: marked("inline"), path: "x.go", line: 88 }),
+          ghComment({
+            id: "b",
+            body: marked("inline"),
+            path: "x.go",
+            line: 88,
+          }),
           ghComment({ id: "c", body: marked("inline"), path: "y.go", line: 3 }),
         ],
       }),
@@ -495,7 +633,9 @@ describe("live verification", () => {
       ...base,
       gh: fakeGh({
         issues: [ghComment({ id: "a", body: marked("summary") })],
-        review: [ghComment({ id: "b", body: "🚨 `slopcop/x` — forgot marker" })],
+        review: [
+          ghComment({ id: "b", body: "🚨 `slopcop/x` — forgot marker" }),
+        ],
       }),
     });
     expect(result.status).toBe("commented_partial");

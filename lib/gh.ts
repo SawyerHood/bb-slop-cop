@@ -4,7 +4,11 @@
 // and comment state itself rather than trusting a transcript. Mirrors the
 // official github plugin's execFile approach.
 import { execFile } from "node:child_process";
-import type { PullRequest } from "./types";
+import type {
+  PullRequest,
+  TriggerComment,
+  TriggerCommentSource,
+} from "./types";
 
 export class GhError extends Error {
   constructor(
@@ -27,6 +31,14 @@ export interface GhClient {
   listIssueComments(repo: string, number: number): Promise<GhComment[]>;
   listReviewComments(repo: string, number: number): Promise<GhComment[]>;
   listReviews(repo: string, number: number): Promise<GhComment[]>;
+  listRecentIssueComments(
+    repo: string,
+    since: number,
+  ): Promise<TriggerComment[]>;
+  listRecentReviewComments(
+    repo: string,
+    since: number,
+  ): Promise<TriggerComment[]>;
   authenticatedLogin(): Promise<string | null>;
 }
 
@@ -40,11 +52,7 @@ export interface GhComment {
   createdAt: number;
 }
 
-function run(
-  file: string,
-  args: string[],
-  timeoutMs: number,
-): Promise<string> {
+function run(file: string, args: string[], timeoutMs: number): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile(
       file,
@@ -110,6 +118,8 @@ export function toPullRequest(raw: unknown): PullRequest {
   return {
     number: typeof row.number === "number" ? row.number : 0,
     title: typeof row.title === "string" ? row.title : "",
+    body: typeof row.body === "string" ? row.body : "",
+    createdAt: toTimestamp(row.created_at),
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
     baseRefName: typeof base.ref === "string" ? base.ref : "",
@@ -135,20 +145,50 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const apiRows = async (endpoint: string): Promise<unknown[]> => {
     const stdout = await run(
       ghPath,
-      ["api", "--paginate", endpoint],
+      ["api", "--paginate", "--slurp", endpoint],
       timeoutMs,
     );
     const parsed: unknown = JSON.parse(stdout);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
   };
   const api = async (endpoint: string): Promise<GhComment[]> =>
     (await apiRows(endpoint)).map(toComment);
+  const recentComments = async (
+    repo: string,
+    source: TriggerCommentSource,
+    since: number,
+  ): Promise<TriggerComment[]> => {
+    const path = source === "issue" ? "issues/comments" : "pulls/comments";
+    const rows = await apiRows(
+      `repos/${repo}/${path}?sort=updated&direction=asc&since=${new Date(since).toISOString()}&per_page=100`,
+    );
+    return rows.map((raw) => {
+      const row = asRecord(raw);
+      const user = asRecord(row.user);
+      const prUrl = source === "issue" ? row.issue_url : row.pull_request_url;
+      const match = typeof prUrl === "string" ? prUrl.match(/\/(\d+)$/) : null;
+      return {
+        id: String(row.id ?? ""),
+        source,
+        repo,
+        prNumber: match === null ? 0 : Number.parseInt(match[1]!, 10),
+        body: typeof row.body === "string" ? row.body : "",
+        url: typeof row.html_url === "string" ? row.html_url : null,
+        author: typeof user.login === "string" ? user.login : null,
+        authorAssociation:
+          typeof row.author_association === "string"
+            ? row.author_association
+            : "NONE",
+        createdAt: toTimestamp(row.created_at),
+        updatedAt: toTimestamp(row.updated_at ?? row.created_at),
+      };
+    });
+  };
 
   return {
     async listOpenPullRequests(repo) {
-      const rows = await apiRows(
-        `repos/${repo}/pulls?state=open&per_page=100`,
-      );
+      const rows = await apiRows(`repos/${repo}/pulls?state=open&per_page=100`);
       return rows.map(toPullRequest);
     },
 
@@ -175,6 +215,10 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
     listReviewComments: (repo, number) =>
       api(`repos/${repo}/pulls/${number}/comments`),
     listReviews: (repo, number) => api(`repos/${repo}/pulls/${number}/reviews`),
+    listRecentIssueComments: (repo, since) =>
+      recentComments(repo, "issue", since),
+    listRecentReviewComments: (repo, since) =>
+      recentComments(repo, "review", since),
 
     async authenticatedLogin() {
       try {

@@ -38,8 +38,10 @@ interface RuleView {
   enabled: boolean;
   mode: string;
   triggers: string[];
+  commentKeywords: string[];
   conditions: ConditionView[];
   authorTrust: string;
+  requesterTrust: string;
   prompt: string;
   request: unknown;
   dedupe: string;
@@ -57,6 +59,7 @@ interface RunView {
   prAuthor: string;
   status: string;
   mode: string;
+  trigger: string;
   detail: string | null;
   threadId: string | null;
   commentCount: number;
@@ -234,6 +237,9 @@ function RulesList({
                 {trigger.replace(/_/g, " ")}
               </Chip>
             ))}
+            {rule.commentKeywords.map((keyword) => (
+              <Chip key={keyword}>{keyword}</Chip>
+            ))}
             {rule.conditions.map((condition, index) => (
               <Chip key={index}>{describeCondition(condition)}</Chip>
             ))}
@@ -272,7 +278,6 @@ function extractPromptText(input: unknown): string {
     .join("")
     .trim();
 }
-
 
 /**
  * Run a rule against one PR on demand.
@@ -381,6 +386,9 @@ function RuleEditor({
   const [name, setName] = useState(rule?.name ?? "");
   const [repo, setRepo] = useState(rule?.repo ?? "");
   const [trust, setTrust] = useState(rule?.authorTrust ?? "write_access");
+  const [requesterTrust, setRequesterTrust] = useState(
+    rule?.requesterTrust ?? "write_access",
+  );
   const [mode, setMode] = useState(rule?.mode ?? "shadow");
   const [visibility, setVisibility] = useState(rule?.visibility ?? "visible");
 
@@ -397,6 +405,9 @@ function RuleEditor({
   } | null;
   const [triggers, setTriggers] = useState<string[]>(
     rule?.triggers ?? ["ready_for_review"],
+  );
+  const [commentKeywords, setCommentKeywords] = useState(
+    (rule?.commentKeywords ?? []).join(", "),
   );
   const [pathGlobs, setPathGlobs] = useState<string>(
     (
@@ -440,6 +451,21 @@ function RuleEditor({
         toast.error("Repository must look like owner/repo");
         throw new Error("bad repo");
       }
+      if (triggers.length === 0) {
+        toast.error("Select at least one trigger");
+        throw new Error("missing trigger");
+      }
+      const keywords = commentKeywords
+        .split(",")
+        .map((value) => value.trim())
+        .filter(Boolean);
+      const usesKeywordTrigger = triggers.some((trigger) =>
+        ["comment_matches", "pr_description_matches"].includes(trigger),
+      );
+      if (usesKeywordTrigger && keywords.length === 0) {
+        toast.error("Add at least one comment or description keyword");
+        throw new Error("missing keyword");
+      }
       const input = (request as { input?: unknown }).input;
       await rpc.call("saveRule", {
         id: rule?.id ?? null,
@@ -448,12 +474,26 @@ function RuleEditor({
           repo: repo.trim(),
           enabled: rule?.enabled ?? true,
           mode: mode as "shadow" | "live",
-          triggers: triggers as ("ready_for_review" | "new_commits")[],
+          triggers: triggers as (
+            | "ready_for_review"
+            | "new_commits"
+            | "pr_description_matches"
+            | "comment_matches"
+          )[],
+          commentKeywords: keywords,
           conditions: conditions as never,
-          authorTrust: trust as "write_access",
+          authorTrust: trust as "write_access" | "past_contributors" | "anyone",
+          requesterTrust: requesterTrust as
+            | "write_access"
+            | "past_contributors"
+            | "anyone",
           prompt: extractPromptText(input),
           request: request as never,
-          dedupe: (rule?.dedupe ?? "once_per_pr") as "once_per_pr",
+          dedupe: (rule?.dedupe ??
+            (usesKeywordTrigger ? "once_per_trigger_event" : "once_per_pr")) as
+            | "once_per_pr"
+            | "once_per_head_sha"
+            | "once_per_trigger_event",
           reviewStrategy: (rule?.reviewStrategy ?? "update") as "update",
           visibility: visibility as "visible" | "hidden",
         },
@@ -466,11 +506,13 @@ function RuleEditor({
       onDone();
     },
     [
+      commentKeywords,
       conditions,
       mode,
       name,
       onDone,
       repo,
+      requesterTrust,
       rpc,
       rule,
       triggers,
@@ -508,8 +550,13 @@ function RuleEditor({
         <span className="text-xs font-semibold text-muted-foreground">
           Trigger
         </span>
-        <div className="flex gap-1.5">
-          {["ready_for_review", "new_commits"].map((trigger) => (
+        <div className="flex flex-wrap gap-1.5">
+          {[
+            "ready_for_review",
+            "new_commits",
+            "pr_description_matches",
+            "comment_matches",
+          ].map((trigger) => (
             <button
               key={trigger}
               type="button"
@@ -531,6 +578,39 @@ function RuleEditor({
           ))}
         </div>
       </div>
+
+      {triggers.some((trigger) =>
+        ["comment_matches", "pr_description_matches"].includes(trigger),
+      ) ? (
+        <div className="grid grid-cols-2 gap-3">
+          <label className="flex flex-col gap-1.5">
+            <span className="text-xs font-semibold text-muted-foreground">
+              Match keywords
+            </span>
+            <Input
+              value={commentKeywords}
+              onChange={(event) => setCommentKeywords(event.target.value)}
+              placeholder="@slopcop, slop check"
+            />
+          </label>
+          {triggers.includes("comment_matches") ? (
+            <label className="flex flex-col gap-1.5">
+              <span className="text-xs font-semibold text-muted-foreground">
+                Who can request a review
+              </span>
+              <select
+                value={requesterTrust}
+                onChange={(event) => setRequesterTrust(event.target.value)}
+                className="h-9 rounded-md border border-input bg-card px-2 text-xs"
+              >
+                <option value="write_access">Write access only</option>
+                <option value="past_contributors">+ past contributors</option>
+                <option value="anyone">Anyone</option>
+              </select>
+            </label>
+          ) : null}
+        </div>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3">
         <label className="flex flex-col gap-1.5">
@@ -655,7 +735,9 @@ function RuleEditor({
           ))}
         </div>
         {dangerous ? (
-          <span className="text-xs text-warning-text">⚠ live + any author</span>
+          <span className="text-xs text-warning-text">
+            ⚠ live + any author
+          </span>
         ) : null}
         <span className="flex-1" />
         {rule !== null ? (
@@ -734,6 +816,7 @@ function Activity({ runs }: { runs: RunView[] }) {
               <div className="mt-0.5 flex flex-wrap items-center gap-2 text-xs text-subtle-foreground">
                 <span className="text-muted-foreground">{run.ruleName}</span>
                 {run.mode === "shadow" ? <span>shadow</span> : null}
+                <span>{run.trigger.replace(/_/g, " ")}</span>
                 <span>{relative(run.startedAt)}</span>
                 {run.threadId !== null ? (
                   <button
@@ -861,7 +944,9 @@ function SlopCopPanel() {
         ))}
         <span className="flex-1" />
         {ghLogin === null ? (
-          <span className="text-xs text-warning-text">gh not authenticated</span>
+          <span className="text-xs text-warning-text">
+            gh not authenticated
+          </span>
         ) : (
           <span className="text-xs text-subtle-foreground">gh: {ghLogin}</span>
         )}

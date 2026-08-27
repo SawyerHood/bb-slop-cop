@@ -162,39 +162,66 @@ Two consequences worth knowing:
 
 ## Commands
 
-| | |
-|---|---|
-| `bb slopcop rules` | List rules |
-| `bb slopcop rules add\|edit <rule>` | Create or update (see flags below) |
-| `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete |
-| `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
-| `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
-| `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
-| `bb slopcop show [run-id]` | A run and the review body it produced |
-| `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
-| `bb slopcop status` | gh auth, watched repos, poll interval |
+|                                               |                                                 |
+| --------------------------------------------- | ----------------------------------------------- |
+| `bb slopcop rules`                            | List rules                                      |
+| `bb slopcop rules add\|edit <rule>`           | Create or update (see flags below)              |
+| `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete                                |
+| `bb slopcop check <rule> <pr>`                | Dry run — match, or the exact reason it did not |
+| `bb slopcop dispatch <rule> <pr> [--force]`   | Run now                                         |
+| `bb slopcop runs [--rule <r>] [--limit N]`    | Recent runs                                     |
+| `bb slopcop show [run-id]`                    | A run and the review body it produced           |
+| `bb slopcop verify [run-id]`                  | Re-check a live run's comments against GitHub   |
+| `bb slopcop status`                           | gh auth, watched repos, poll interval           |
 
 Plugin settings: `defaultThreadSection` accepts a BB thread section name or ID.
 SlopCop fails a run with a clear error if that section no longer exists. `botGhPath`
 switches every GitHub call to a bot identity — see above.
 
 Rule flags: `--name --repo --project --provider --model --reasoning --permission
---prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger
---live --shadow --disabled --hidden --visible`. Add `--json` to any command.
+--prompt --paths --base --label --skip-label --trust --requester-trust --dedupe
+--strategy --trigger --keyword --live --shadow --disabled --hidden --visible`.
+Add `--json` to any command.
 
 `check` answers "why didn't SlopCop review my PR?" with the single decisive reason.
 
 ## Rules
 
-| Field | Meaning |
-|---|---|
-| `repo` | One `owner/repo` per rule |
-| `triggers` | `ready_for_review`, `new_commits` |
-| `conditions` | Changed paths, base branch, labels, author, title regex, diff size — ANDed |
-| `authorTrust` | `write_access` (default), `past_contributors`, `anyone` |
-| `mode` | `shadow` (default) or `live` |
-| `dedupe` | `once_per_pr` (default) or `once_per_head_sha` |
-| `visibility` | `visible` (default) or `hidden` review threads |
+| Field             | Meaning                                                                        |
+| ----------------- | ------------------------------------------------------------------------------ |
+| `repo`            | One `owner/repo` per rule                                                      |
+| `triggers`        | `ready_for_review`, `new_commits`, `pr_description_matches`, `comment_matches` |
+| `commentKeywords` | Case-insensitive literal tokens used by description and comment triggers       |
+| `conditions`      | Changed paths, base branch, labels, author, title regex, diff size — ANDed     |
+| `authorTrust`     | `write_access` (default), `past_contributors`, `anyone`                        |
+| `requesterTrust`  | Who can request a review through a comment; `write_access` by default          |
+| `mode`            | `shadow` (default) or `live`                                                   |
+| `dedupe`          | `once_per_pr`, `once_per_head_sha`, or `once_per_trigger_event`                |
+| `visibility`      | `visible` (default) or `hidden` review threads                                 |
+
+### Keyword-triggered reviews
+
+Use a keyword trigger to run a rule only after an explicit request:
+
+```sh
+bb slopcop rules add \
+  --name requested-review \
+  --repo owner/repo \
+  --project <bb-project-name> \
+  --trigger comment_matches,pr_description_matches \
+  --keyword "@slopcop" \
+  --requester-trust write_access \
+  --dedupe once_per_trigger_event
+```
+
+Keywords use case-insensitive, complete-token matches. `@slopcop-test` does not
+match `@slopcop`. General PR comments and inline review comments can request a
+review. The bot ignores its own comments. An allowed commenter can request a
+review on any open PR, regardless of the PR author's trust level.
+
+The description trigger checks a new ready PR. It also checks a draft when the
+author marks it ready. Later description edits do not trigger a review. Comment
+polling starts when the trigger becomes active, so old comments do not run it.
 
 ### Run statuses
 

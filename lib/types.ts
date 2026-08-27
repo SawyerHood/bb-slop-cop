@@ -45,8 +45,14 @@ export const TRUSTED_ASSOCIATIONS: Record<
 
 export const conditionSchema = z.discriminatedUnion("kind", [
   z.object({ kind: z.literal("paths"), globs: z.array(z.string()).min(1) }),
-  z.object({ kind: z.literal("base_branch"), globs: z.array(z.string()).min(1) }),
-  z.object({ kind: z.literal("has_label"), labels: z.array(z.string()).min(1) }),
+  z.object({
+    kind: z.literal("base_branch"),
+    globs: z.array(z.string()).min(1),
+  }),
+  z.object({
+    kind: z.literal("has_label"),
+    labels: z.array(z.string()).min(1),
+  }),
   z.object({
     kind: z.literal("missing_label"),
     labels: z.array(z.string()).min(1),
@@ -63,6 +69,8 @@ export type Condition = z.infer<typeof conditionSchema>;
 export const triggerSchema = z.enum([
   "ready_for_review",
   "new_commits",
+  "pr_description_matches",
+  "comment_matches",
   "manual",
 ]);
 export type Trigger = z.infer<typeof triggerSchema>;
@@ -106,7 +114,11 @@ export type ReviewStrategy = z.infer<typeof reviewStrategySchema>;
 export const visibilitySchema = z.enum(["visible", "hidden"]);
 export type Visibility = z.infer<typeof visibilitySchema>;
 
-export const dedupeSchema = z.enum(["once_per_pr", "once_per_head_sha"]);
+export const dedupeSchema = z.enum([
+  "once_per_pr",
+  "once_per_head_sha",
+  "once_per_trigger_event",
+]);
 export type Dedupe = z.infer<typeof dedupeSchema>;
 
 export const ruleSchema = z.object({
@@ -116,8 +128,11 @@ export const ruleSchema = z.object({
   enabled: z.boolean(),
   mode: ruleModeSchema,
   triggers: z.array(triggerSchema).min(1),
+  commentKeywords: z.array(z.string().min(1)),
   conditions: z.array(conditionSchema),
   authorTrust: authorTrustSchema,
+  requesterTrust: authorTrustSchema,
+  commentTriggerEnabledAt: z.number().int().nullable(),
   prompt: z.string(),
   request: threadRequestSchema.nullable(),
   dedupe: dedupeSchema,
@@ -165,6 +180,8 @@ export interface Run {
   prTitle: string;
   prAuthor: string;
   headSha: string;
+  trigger: Trigger;
+  triggerEventId: string | null;
   status: RunStatus;
   mode: RuleMode;
   detail: string | null;
@@ -178,6 +195,8 @@ export interface Run {
 export interface PullRequest {
   number: number;
   title: string;
+  body: string;
+  createdAt: number;
   isDraft: boolean;
   headRefOid: string;
   baseRefName: string;
@@ -187,4 +206,36 @@ export interface PullRequest {
   files: { path: string }[];
   isCrossRepository: boolean;
   updatedAt: string;
+}
+
+export type TriggerCommentSource = "issue" | "review";
+
+/** A PR comment that can request a SlopCop review. */
+export interface TriggerComment {
+  id: string;
+  source: TriggerCommentSource;
+  repo: string;
+  prNumber: number;
+  body: string;
+  url: string | null;
+  author: string | null;
+  authorAssociation: AuthorAssociation | string;
+  createdAt: number;
+  updatedAt: number;
+}
+
+/** A durable request. The watcher keeps it pending when review capacity is full. */
+export interface CommentTriggerEvent {
+  ruleId: string;
+  source: TriggerCommentSource;
+  commentId: string;
+  repo: string;
+  prNumber: number;
+  author: string;
+  authorAssociation: string;
+  matchedKeyword: string;
+  url: string | null;
+  createdAt: number;
+  status: "pending" | "processed" | "ignored";
+  detail: string | null;
 }

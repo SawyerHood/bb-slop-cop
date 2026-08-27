@@ -27,12 +27,18 @@ export function computeTriggers(input: {
   isDraft: boolean;
   headSha: string;
   repoBootstrapped: boolean;
+  createdAt: number;
+  watchStartedAt: number;
 }): Trigger[] {
   if (input.isDraft) return [];
   const { seen } = input;
   if (seen === null) {
-    // Unseen during the bootstrap pass = pre-existing backlog, not a trigger.
-    return input.repoBootstrapped ? ["ready_for_review"] : [];
+    // The first pass ignores the old backlog but keeps a PR posted after the
+    // rule was saved. This closes the rule-save to first-poll race.
+    const createdAfterWatch = input.createdAt >= input.watchStartedAt - 1_000;
+    return input.repoBootstrapped || createdAfterWatch
+      ? ["ready_for_review"]
+      : [];
   }
   if (seen.wasDraft) return ["ready_for_review"];
   return seen.headSha !== input.headSha ? ["new_commits"] : [];
@@ -52,7 +58,11 @@ export function matchGlob(pattern: string, value: string): boolean {
     const char = pattern[index]!;
     // `/**` makes the whole tail optional so `src/auth/**` matches the
     // directory `src/auth` itself, not only files beneath it.
-    if (char === "/" && pattern[index + 1] === "*" && pattern[index + 2] === "*") {
+    if (
+      char === "/" &&
+      pattern[index + 1] === "*" &&
+      pattern[index + 2] === "*"
+    ) {
       expression += "(?:/.*)?";
       index += 2;
       continue;
@@ -77,6 +87,34 @@ export function matchGlob(pattern: string, value: string): boolean {
 
 function matchesAnyGlob(patterns: string[], value: string): boolean {
   return patterns.some((pattern) => matchGlob(pattern.trim(), value));
+}
+
+/** Returns the first case-insensitive literal keyword found as a full token. */
+export function findMatchingKeyword(
+  body: string,
+  keywords: string[],
+): string | null {
+  for (const rawKeyword of keywords) {
+    const keyword = rawKeyword.trim();
+    if (keyword.length === 0) continue;
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const expression = new RegExp(
+      `(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`,
+      "iu",
+    );
+    if (expression.test(body)) return keyword;
+  }
+  return null;
+}
+
+export function matchesPrDescription(
+  rule: Rule,
+  pullRequest: PullRequest,
+): boolean {
+  return (
+    rule.triggers.includes("pr_description_matches") &&
+    findMatchingKeyword(pullRequest.body, rule.commentKeywords) !== null
+  );
 }
 
 export function isTrustedAuthor(
@@ -149,6 +187,7 @@ export function evaluateRule(
   rule: Rule,
   pullRequest: PullRequest,
   trigger: Trigger,
+  options: { skipAuthorTrust?: boolean } = {},
 ): MatchResult {
   if (!rule.enabled) {
     return { matched: false, reason: "rule is disabled" };
@@ -159,7 +198,10 @@ export function evaluateRule(
   if (pullRequest.isDraft) {
     return { matched: false, reason: "pull request is a draft" };
   }
-  if (!isTrustedAuthor(pullRequest.authorAssociation, rule.authorTrust)) {
+  if (
+    options.skipAuthorTrust !== true &&
+    !isTrustedAuthor(pullRequest.authorAssociation, rule.authorTrust)
+  ) {
     const login = pullRequest.author?.login ?? "unknown";
     return {
       matched: false,
