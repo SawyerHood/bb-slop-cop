@@ -14589,6 +14589,8 @@ function toPullRequest(raw) {
     kind: "pull_request",
     number: typeof row.number === "number" ? row.number : 0,
     title: typeof row.title === "string" ? row.title : "",
+    body: typeof row.body === "string" ? row.body : "",
+    createdAt: toTimestamp(row.created_at),
     isDraft: row.draft === true,
     headRefOid: typeof head.sha === "string" ? head.sha : "",
     baseRefName: typeof base.ref === "string" ? base.ref : "",
@@ -14640,6 +14642,30 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
     return parsed.flatMap((page) => Array.isArray(page) ? page : [page]);
   };
   const api = async (endpoint) => (await apiRows(endpoint)).map(toComment);
+  const recentComments = async (repo, source, since) => {
+    const path = source === "issue" ? "issues/comments" : "pulls/comments";
+    const rows = await apiRows(
+      `repos/${repo}/${path}?sort=updated&direction=asc&since=${new Date(since).toISOString()}&per_page=100`
+    );
+    return rows.map((raw) => {
+      const row = asRecord(raw);
+      const user = asRecord(row.user);
+      const prUrl = source === "issue" ? row.issue_url : row.pull_request_url;
+      const match = typeof prUrl === "string" ? prUrl.match(/\/(\d+)$/) : null;
+      return {
+        id: String(row.id ?? ""),
+        source,
+        repo,
+        prNumber: match === null ? 0 : Number.parseInt(match[1], 10),
+        body: typeof row.body === "string" ? row.body : "",
+        url: typeof row.html_url === "string" ? row.html_url : null,
+        author: typeof user.login === "string" ? user.login : null,
+        authorAssociation: typeof row.author_association === "string" ? row.author_association : "NONE",
+        createdAt: toTimestamp(row.created_at),
+        updatedAt: toTimestamp(row.updated_at ?? row.created_at)
+      };
+    });
+  };
   return {
     async listOpenPullRequests(repo) {
       const rows = await apiRows(`repos/${repo}/pulls?state=open&per_page=100`);
@@ -14695,6 +14721,8 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
     listIssueComments: (repo, number4) => api(`repos/${repo}/issues/${number4}/comments`),
     listReviewComments: (repo, number4) => api(`repos/${repo}/pulls/${number4}/comments`),
     listReviews: (repo, number4) => api(`repos/${repo}/pulls/${number4}/reviews`),
+    listRecentIssueComments: (repo, since) => recentComments(repo, "issue", since),
+    listRecentReviewComments: (repo, since) => recentComments(repo, "review", since),
     async authenticatedLogin() {
       try {
         const stdout = await run(
@@ -14796,13 +14824,40 @@ var MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS watched_issue_repos (
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
-   )`
+   )`,
+  `ALTER TABLE runs ADD COLUMN trigger_event_id TEXT`,
+  `CREATE TABLE IF NOT EXISTS comment_cursors (
+     repo TEXT NOT NULL,
+     source TEXT NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, source)
+   )`,
+  `CREATE TABLE IF NOT EXISTS comment_trigger_events (
+     rule_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     comment_id TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     author TEXT NOT NULL DEFAULT '',
+     author_association TEXT NOT NULL DEFAULT 'NONE',
+     matched_keyword TEXT NOT NULL,
+     url TEXT,
+     created_at INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     detail TEXT,
+     PRIMARY KEY (rule_id, source, comment_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_comment_events_pending
+     ON comment_trigger_events(repo, status, created_at)`,
+  `ALTER TABLE rules ADD COLUMN comment_trigger_enabled_at INTEGER`
 ];
-function repairIssueSchema(db) {
-  const hasTargetKind = db.prepare(`PRAGMA table_info(runs)`).all().some(
-    (row) => typeof row === "object" && row !== null && Reflect.get(row, "name") === "target_kind"
+function hasColumn(db, table, column) {
+  return db.prepare(`PRAGMA table_info(${table})`).all().some(
+    (row) => typeof row === "object" && row !== null && Reflect.get(row, "name") === column
   );
-  if (!hasTargetKind) {
+}
+function repairIssueSchema(db) {
+  if (!hasColumn(db, "runs", "target_kind")) {
     db.exec(
       `ALTER TABLE runs ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'pull_request'`
     );
@@ -14817,6 +14872,43 @@ function repairIssueSchema(db) {
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
    )`);
+}
+function repairKeywordSchema(db) {
+  const columns = [
+    ["rules", "comment_keywords", `TEXT NOT NULL DEFAULT '[]'`],
+    ["rules", "requester_trust", `TEXT NOT NULL DEFAULT 'write_access'`],
+    ["runs", "trigger", `TEXT NOT NULL DEFAULT 'manual'`],
+    ["runs", "trigger_event_id", `TEXT`],
+    ["rules", "comment_trigger_enabled_at", `INTEGER`]
+  ];
+  for (const [table, column, definition] of columns) {
+    if (!hasColumn(db, table, column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_cursors (
+     repo TEXT NOT NULL,
+     source TEXT NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, source)
+   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_trigger_events (
+     rule_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     comment_id TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     author TEXT NOT NULL DEFAULT '',
+     author_association TEXT NOT NULL DEFAULT 'NONE',
+     matched_keyword TEXT NOT NULL,
+     url TEXT,
+     created_at INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     detail TEXT,
+     PRIMARY KEY (rule_id, source, comment_id)
+   )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_events_pending
+     ON comment_trigger_events(repo, status, created_at)`);
 }
 function text(row, key, fallback = "") {
   const value = row[key];
@@ -14842,12 +14934,19 @@ function rowToRule(row) {
     enabled: num(row, "enabled") === 1,
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     triggers: parseJson(row.triggers, ["ready_for_review"]),
+    commentKeywords: parseJson(row.comment_keywords, []),
     conditions: parseJson(row.conditions, []),
     authorTrust: text(
       row,
       "author_trust",
       "write_access"
     ),
+    requesterTrust: text(
+      row,
+      "requester_trust",
+      "write_access"
+    ),
+    commentTriggerEnabledAt: typeof row.comment_trigger_enabled_at === "number" ? row.comment_trigger_enabled_at : null,
     prompt: text(row, "prompt"),
     request: parseJson(row.request, null),
     dedupe: text(row, "dedupe", "once_per_pr"),
@@ -14872,6 +14971,8 @@ function rowToRun(row) {
     prTitle: text(row, "pr_title"),
     prAuthor: text(row, "pr_author"),
     headSha: text(row, "head_sha"),
+    trigger: text(row, "trigger", "manual"),
+    triggerEventId: typeof row.trigger_event_id === "string" ? row.trigger_event_id : null,
     status: text(row, "status", "dispatched"),
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     detail: typeof row.detail === "string" ? row.detail : null,
@@ -14896,14 +14997,18 @@ function createStore(db) {
     },
     upsertRule(rule) {
       db.prepare(
-        `INSERT INTO rules (id, name, repo, enabled, mode, triggers, conditions,
-           author_trust, prompt, request, dedupe, review_strategy, visibility,
-           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO rules (id, name, repo, enabled, mode, triggers,
+           comment_keywords, conditions, author_trust, requester_trust,
+           comment_trigger_enabled_at, prompt, request, dedupe, review_strategy,
+           visibility, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, repo = excluded.repo, enabled = excluded.enabled,
            mode = excluded.mode, triggers = excluded.triggers,
+           comment_keywords = excluded.comment_keywords,
            conditions = excluded.conditions, author_trust = excluded.author_trust,
+           requester_trust = excluded.requester_trust,
+           comment_trigger_enabled_at = excluded.comment_trigger_enabled_at,
            prompt = excluded.prompt, request = excluded.request,
            dedupe = excluded.dedupe, review_strategy = excluded.review_strategy,
            visibility = excluded.visibility, updated_at = excluded.updated_at`
@@ -14914,8 +15019,11 @@ function createStore(db) {
         rule.enabled ? 1 : 0,
         rule.mode,
         JSON.stringify(rule.triggers),
+        JSON.stringify(rule.commentKeywords),
         JSON.stringify(rule.conditions),
         rule.authorTrust,
+        rule.requesterTrust,
+        rule.commentTriggerEnabledAt,
         rule.prompt,
         rule.request === null ? null : JSON.stringify(rule.request),
         rule.dedupe,
@@ -14926,6 +15034,9 @@ function createStore(db) {
       );
     },
     deleteRule(id) {
+      db.prepare(`DELETE FROM comment_trigger_events WHERE rule_id = ?`).run(
+        id
+      );
       db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
     },
     listRuns(options = {}) {
@@ -14941,10 +15052,10 @@ function createStore(db) {
     },
     insertRun(run2) {
       db.prepare(
-        `INSERT INTO runs (id, rule_id, rule_name, repo, target_kind, pr_number, pr_title,
-           pr_author, head_sha, status, mode, detail, thread_id, comment_count,
-           started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `INSERT INTO runs (id, rule_id, rule_name, repo, target_kind, pr_number,
+           pr_title, pr_author, head_sha, trigger, trigger_event_id, status, mode,
+           detail, thread_id, comment_count, started_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         run2.id,
         run2.ruleId,
@@ -14955,6 +15066,8 @@ function createStore(db) {
         run2.prTitle,
         run2.prAuthor,
         run2.headSha,
+        run2.trigger,
+        run2.triggerEventId,
         run2.status,
         run2.mode,
         run2.detail,
@@ -14998,8 +15111,12 @@ function createStore(db) {
       return row === void 0 ? null : rowToRun(row);
     },
     /** Dedupe: has this rule already run for this target or exact PR commit? */
-    hasRunFor(ruleId, repo, targetKind, prNumber, headSha) {
-      const row = headSha === null ? db.prepare(
+    hasRunFor(ruleId, repo, targetKind, prNumber, headSha, triggerEventId = null) {
+      const row = triggerEventId !== null ? db.prepare(
+        `SELECT 1 AS hit FROM runs
+                 WHERE rule_id = ? AND trigger_event_id = ?
+                   AND status NOT IN ('skipped', 'failed') LIMIT 1`
+      ).get(ruleId, triggerEventId) : headSha === null ? db.prepare(
         `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
                    AND target_kind = ?
@@ -15094,6 +15211,66 @@ function createStore(db) {
          ON CONFLICT(repo, issue_number) DO UPDATE SET
            updated_at = excluded.updated_at`
       ).run(repo, issueNumber, now);
+    },
+    getCommentCursor(repo, source) {
+      const row = db.prepare(
+        `SELECT updated_at FROM comment_cursors WHERE repo = ? AND source = ?`
+      ).get(repo, source);
+      return row === void 0 ? null : num(row, "updated_at");
+    },
+    setCommentCursor(repo, source, updatedAt) {
+      db.prepare(
+        `INSERT INTO comment_cursors (repo, source, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(repo, source) DO UPDATE SET updated_at = excluded.updated_at`
+      ).run(repo, source, updatedAt);
+    },
+    enqueueCommentEvent(event) {
+      db.prepare(
+        `INSERT OR IGNORE INTO comment_trigger_events
+           (rule_id, source, comment_id, repo, pr_number, author,
+            author_association, matched_keyword, url, created_at, status, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      ).run(
+        event.ruleId,
+        event.source,
+        event.commentId,
+        event.repo,
+        event.prNumber,
+        event.author,
+        event.authorAssociation,
+        event.matchedKeyword,
+        event.url,
+        event.createdAt,
+        event.status,
+        event.detail
+      );
+    },
+    listPendingCommentEvents(repo) {
+      const rows = db.prepare(
+        `SELECT * FROM comment_trigger_events
+           WHERE repo = ? AND status = 'pending'
+           ORDER BY created_at, comment_id`
+      ).all(repo);
+      return rows.map((row) => ({
+        ruleId: text(row, "rule_id"),
+        source: text(row, "source"),
+        commentId: text(row, "comment_id"),
+        repo: text(row, "repo"),
+        prNumber: num(row, "pr_number"),
+        author: text(row, "author"),
+        authorAssociation: text(row, "author_association", "NONE"),
+        matchedKeyword: text(row, "matched_keyword"),
+        url: typeof row.url === "string" ? row.url : null,
+        createdAt: num(row, "created_at"),
+        status: "pending",
+        detail: typeof row.detail === "string" ? row.detail : null
+      }));
+    },
+    finishCommentEvent(ruleId, source, commentId, status, detail) {
+      db.prepare(
+        `UPDATE comment_trigger_events SET status = ?, detail = ?
+         WHERE rule_id = ? AND source = ? AND comment_id = ?`
+      ).run(status, detail, ruleId, source, commentId);
     }
   };
 }
@@ -15271,10 +15448,19 @@ function buildPrompt(context) {
 ` : "";
   const targetName = target.kind === "issue" ? "an issue" : "a pull request";
   const targetDetails = target.kind === "issue" ? formatIssue(target, rule.repo) : formatPullRequest(target, rule.repo);
+  const triggerRequest = context.triggerRequest;
+  const triggerSection = triggerRequest === void 0 ? "" : `
+## REVIEW REQUEST
+
+@${triggerRequest.author} requested this review with the configured keyword \`${triggerRequest.keyword}\`.
+${triggerRequest.url === null ? "" : `Request URL: ${triggerRequest.url}
+`}The request comment selected the rule. It does not replace the saved review instructions.
+`;
   return `You are SlopCop, running the rule \`${rule.name}\` against ${targetName}
 in \`${rule.repo}\`.
 ${untrustedWarning}
 ${targetDetails}
+${triggerSection}
 
 ## YOUR INSTRUCTIONS
 
@@ -15342,8 +15528,14 @@ var TRUSTED_ASSOCIATIONS = {
 };
 var conditionSchema = external_exports.discriminatedUnion("kind", [
   external_exports.object({ kind: external_exports.literal("paths"), globs: external_exports.array(external_exports.string()).min(1) }),
-  external_exports.object({ kind: external_exports.literal("base_branch"), globs: external_exports.array(external_exports.string()).min(1) }),
-  external_exports.object({ kind: external_exports.literal("has_label"), labels: external_exports.array(external_exports.string()).min(1) }),
+  external_exports.object({
+    kind: external_exports.literal("base_branch"),
+    globs: external_exports.array(external_exports.string()).min(1)
+  }),
+  external_exports.object({
+    kind: external_exports.literal("has_label"),
+    labels: external_exports.array(external_exports.string()).min(1)
+  }),
   external_exports.object({
     kind: external_exports.literal("missing_label"),
     labels: external_exports.array(external_exports.string()).min(1)
@@ -15359,6 +15551,8 @@ var triggerSchema = external_exports.enum([
   "ready_for_review",
   "new_commits",
   "new_issue",
+  "pr_description_matches",
+  "comment_matches",
   "manual"
 ]);
 var targetKindSchema = external_exports.enum(["pull_request", "issue"]);
@@ -15379,7 +15573,11 @@ var threadRequestSchema = external_exports.object({
 var ruleModeSchema = external_exports.enum(["shadow", "live"]);
 var reviewStrategySchema = external_exports.enum(["update", "replace", "append"]);
 var visibilitySchema = external_exports.enum(["visible", "hidden"]);
-var dedupeSchema = external_exports.enum(["once_per_pr", "once_per_head_sha"]);
+var dedupeSchema = external_exports.enum([
+  "once_per_pr",
+  "once_per_head_sha",
+  "once_per_trigger_event"
+]);
 var ruleSchema = external_exports.object({
   id: external_exports.string(),
   name: external_exports.string().min(1),
@@ -15387,8 +15585,11 @@ var ruleSchema = external_exports.object({
   enabled: external_exports.boolean(),
   mode: ruleModeSchema,
   triggers: external_exports.array(triggerSchema).min(1),
+  commentKeywords: external_exports.array(external_exports.string().min(1)),
   conditions: external_exports.array(conditionSchema),
   authorTrust: authorTrustSchema,
+  requesterTrust: authorTrustSchema,
+  commentTriggerEnabledAt: external_exports.number().int().nullable(),
   prompt: external_exports.string(),
   request: threadRequestSchema.nullable(),
   dedupe: dedupeSchema,
@@ -15416,7 +15617,8 @@ function computeTriggers(input) {
   if (input.isDraft) return [];
   const { seen } = input;
   if (seen === null) {
-    return input.repoBootstrapped ? ["ready_for_review"] : [];
+    const createdAfterWatch = input.createdAt >= input.watchStartedAt - 1e3;
+    return input.repoBootstrapped || createdAfterWatch ? ["ready_for_review"] : [];
   }
   if (seen.wasDraft) return ["ready_for_review"];
   return seen.headSha !== input.headSha ? ["new_commits"] : [];
@@ -15451,6 +15653,22 @@ function matchGlob(pattern, value) {
 }
 function matchesAnyGlob(patterns, value) {
   return patterns.some((pattern) => matchGlob(pattern.trim(), value));
+}
+function findMatchingKeyword(body, keywords) {
+  for (const rawKeyword of keywords) {
+    const keyword = rawKeyword.trim();
+    if (keyword.length === 0) continue;
+    const escaped = keyword.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const expression = new RegExp(
+      `(^|[^\\p{L}\\p{N}_-])${escaped}(?=$|[^\\p{L}\\p{N}_-])`,
+      "iu"
+    );
+    if (expression.test(body)) return keyword;
+  }
+  return null;
+}
+function matchesPrDescription(rule, pullRequest) {
+  return rule.triggers.includes("pr_description_matches") && findMatchingKeyword(pullRequest.body, rule.commentKeywords) !== null;
 }
 function isTrustedAuthor(association, trust) {
   return TRUSTED_ASSOCIATIONS[trust].includes(
@@ -15504,7 +15722,7 @@ function evaluateCondition(condition, target) {
       return target.kind === "issue" || target.files.length <= condition.value;
   }
 }
-function evaluateRule(rule, target, trigger) {
+function evaluateRule(rule, target, trigger, options = {}) {
   if (!rule.enabled) {
     return { matched: false, reason: "rule is disabled" };
   }
@@ -15514,7 +15732,7 @@ function evaluateRule(rule, target, trigger) {
   if (target.kind === "pull_request" && target.isDraft) {
     return { matched: false, reason: "pull request is a draft" };
   }
-  if (!isTrustedAuthor(target.authorAssociation, rule.authorTrust)) {
+  if (options.skipAuthorTrust !== true && !isTrustedAuthor(target.authorAssociation, rule.authorTrust)) {
     const login = target.author?.login ?? "unknown";
     return {
       matched: false,
@@ -15684,13 +15902,26 @@ var ruleInputSchema = external_exports.object({
   enabled: external_exports.boolean().default(true),
   mode: ruleModeSchema.default("shadow"),
   triggers: external_exports.array(triggerSchema).min(1).default(["ready_for_review"]),
+  commentKeywords: external_exports.array(external_exports.string().min(1)).default([]),
   conditions: external_exports.array(conditionSchema).default([]),
   authorTrust: authorTrustSchema.default("write_access"),
+  requesterTrust: authorTrustSchema.default("write_access"),
   prompt: external_exports.string().default(""),
   request: threadRequestSchema.nullable().default(null),
   dedupe: dedupeSchema.default("once_per_pr"),
   reviewStrategy: reviewStrategySchema.default("update"),
   visibility: visibilitySchema.default("visible")
+}).superRefine((rule, context) => {
+  const needsKeywords = rule.triggers.some(
+    (trigger) => ["comment_matches", "pr_description_matches"].includes(trigger)
+  );
+  if (needsKeywords && rule.commentKeywords.length === 0) {
+    context.addIssue({
+      code: "custom",
+      path: ["commentKeywords"],
+      message: "a comment or description trigger needs at least one keyword"
+    });
+  }
 });
 var ruleOutputSchema = external_exports.object({
   id: external_exports.string(),
@@ -15699,8 +15930,11 @@ var ruleOutputSchema = external_exports.object({
   enabled: external_exports.boolean(),
   mode: external_exports.string(),
   triggers: external_exports.array(external_exports.string()),
+  commentKeywords: external_exports.array(external_exports.string()),
   conditions: external_exports.array(external_exports.unknown()),
   authorTrust: external_exports.string(),
+  requesterTrust: external_exports.string(),
+  commentTriggerEnabledAt: external_exports.number().nullable(),
   prompt: external_exports.string(),
   request: external_exports.unknown().nullable(),
   dedupe: external_exports.string(),
@@ -15720,6 +15954,8 @@ var runOutputSchema = external_exports.object({
   prTitle: external_exports.string(),
   prAuthor: external_exports.string(),
   headSha: external_exports.string(),
+  trigger: external_exports.string(),
+  triggerEventId: external_exports.string().nullable(),
   status: external_exports.string(),
   mode: external_exports.string(),
   detail: external_exports.string().nullable(),
@@ -15834,6 +16070,7 @@ async function plugin(bb) {
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   repairIssueSchema(db);
+  repairKeywordSchema(db);
   const store = createStore(db);
   let gh = createGhClient("gh");
   let ghLogin = null;
@@ -15888,6 +16125,8 @@ async function plugin(bb) {
       prTitle: target.title,
       prAuthor: target.author?.login ?? "",
       headSha: target.kind === "pull_request" ? target.headRefOid : "",
+      trigger: options.trigger ?? "manual",
+      triggerEventId: options.triggerEventId ?? null,
       status: "dispatched",
       mode: rule.mode,
       detail: forcedReason === null ? null : `forced past the gate \u2014 ${forcedReason}`,
@@ -15907,7 +16146,14 @@ async function plugin(bb) {
       return { runId, threadId: null };
     }
     const { botGhPath, defaultThreadSection } = await readSettings();
-    const context = { rule, target, runId, ghCommand: botGhPath };
+    const context = {
+      rule,
+      target,
+      runId,
+      ghCommand: botGhPath,
+      trigger: options.trigger,
+      triggerRequest: options.triggerRequest
+    };
     try {
       const { input: _draftInput, ...execution } = rule.request;
       const sources = {
@@ -15952,7 +16198,7 @@ async function plugin(bb) {
       return { runId, threadId: null };
     }
   }
-  function recordSkip(rule, target, reason) {
+  function recordSkip(rule, target, reason, trigger, triggerEventId2) {
     store.insertRun({
       id: newId("run"),
       ruleId: rule.id,
@@ -15963,6 +16209,8 @@ async function plugin(bb) {
       prTitle: target.title,
       prAuthor: target.author?.login ?? "",
       headSha: target.kind === "pull_request" ? target.headRefOid : "",
+      trigger,
+      triggerEventId: triggerEventId2,
       status: "skipped",
       mode: rule.mode,
       detail: reason,
@@ -15972,6 +16220,157 @@ async function plugin(bb) {
       finishedAt: Date.now()
     });
   }
+  function triggerEventId(trigger, pullRequest, comment) {
+    if (comment !== void 0) {
+      return `comment:${comment.source}:${comment.commentId}`;
+    }
+    return `${trigger}:${pullRequest.headRefOid}`;
+  }
+  function hasAlreadyRun(rule, pullRequest, eventId) {
+    return store.hasRunFor(
+      rule.id,
+      rule.repo,
+      "pull_request",
+      pullRequest.number,
+      rule.dedupe === "once_per_head_sha" ? pullRequest.headRefOid : null,
+      rule.dedupe === "once_per_trigger_event" ? eventId : null
+    );
+  }
+  async function ingestCommentEvents(repo, repoRules, pullRequests) {
+    const commentRules = repoRules.filter(
+      (rule) => rule.triggers.includes("comment_matches")
+    );
+    if (commentRules.length === 0) return;
+    const pollStartedAt = Date.now();
+    const earliestRule = Math.min(
+      ...commentRules.map(
+        (rule) => rule.commentTriggerEnabledAt ?? rule.updatedAt
+      )
+    );
+    const sources = ["issue", "review"];
+    for (const source of sources) {
+      const cursor = store.getCommentCursor(repo, source) ?? earliestRule;
+      const since = Math.max(0, cursor - 5e3);
+      try {
+        const comments = source === "issue" ? await gh.listRecentIssueComments(repo, since) : await gh.listRecentReviewComments(repo, since);
+        for (const comment of comments) {
+          if (!pullRequests.has(comment.prNumber)) continue;
+          if (ghLogin !== null && comment.author?.toLowerCase() === ghLogin.toLowerCase()) {
+            continue;
+          }
+          for (const rule of commentRules) {
+            const enabledAt = rule.commentTriggerEnabledAt ?? rule.updatedAt;
+            if (comment.createdAt < enabledAt - 1e3) continue;
+            const keyword = findMatchingKeyword(
+              comment.body,
+              rule.commentKeywords
+            );
+            if (keyword === null) continue;
+            store.enqueueCommentEvent({
+              ruleId: rule.id,
+              source,
+              commentId: comment.id,
+              repo,
+              prNumber: comment.prNumber,
+              author: comment.author ?? "unknown",
+              authorAssociation: String(comment.authorAssociation),
+              matchedKeyword: keyword,
+              url: comment.url,
+              createdAt: comment.createdAt,
+              status: "pending",
+              detail: null
+            });
+          }
+        }
+        store.setCommentCursor(repo, source, pollStartedAt);
+      } catch (error51) {
+        bb.log.warn(
+          `comment poll failed for ${repo} (${source}): ${error51 instanceof Error ? error51.message : String(error51)}`
+        );
+      }
+    }
+  }
+  async function processCommentEvents(repo, repoRules, pullRequests, maxConcurrent) {
+    for (const event of store.listPendingCommentEvents(repo)) {
+      const rule = repoRules.find((candidate) => candidate.id === event.ruleId);
+      const pullRequest = pullRequests.get(event.prNumber);
+      if (rule === void 0 || pullRequest === void 0) {
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          rule === void 0 ? "rule is no longer enabled" : "PR is not open"
+        );
+        continue;
+      }
+      const eventId = triggerEventId("comment_matches", pullRequest, event);
+      if (!isTrustedAuthor(event.authorAssociation, rule.requesterTrust)) {
+        const reason = `requester @${event.author} is ${event.authorAssociation}, and this rule only accepts ${describeTrust(rule.requesterTrust)}`;
+        recordSkip(rule, pullRequest, reason, "comment_matches", eventId);
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          reason
+        );
+        announce();
+        continue;
+      }
+      await hydrateFiles([rule], repo, pullRequest);
+      const result = evaluateRule(rule, pullRequest, "comment_matches", {
+        skipAuthorTrust: true
+      });
+      if (!result.matched) {
+        if (result.blockedByTrust) {
+          recordSkip(
+            rule,
+            pullRequest,
+            result.reason,
+            "comment_matches",
+            eventId
+          );
+          announce();
+        }
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          result.reason
+        );
+        continue;
+      }
+      if (hasAlreadyRun(rule, pullRequest, eventId)) {
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "processed",
+          "dedupe policy already matched a run"
+        );
+        continue;
+      }
+      if (inFlight >= maxConcurrent) return;
+      await dispatch(rule, pullRequest, {
+        trigger: "comment_matches",
+        triggerEventId: eventId,
+        triggerRequest: {
+          author: event.author,
+          keyword: event.matchedKeyword,
+          url: event.url
+        }
+      });
+      store.finishCommentEvent(
+        event.ruleId,
+        event.source,
+        event.commentId,
+        "processed",
+        null
+      );
+    }
+  }
   async function poll(maxConcurrent) {
     const rules = store.listRules().filter((rule) => rule.enabled);
     const repos = [...new Set(rules.map((rule) => rule.repo))];
@@ -15979,7 +16378,7 @@ async function plugin(bb) {
       const repoRules = rules.filter((candidate) => candidate.repo === repo);
       const pullRequestRules = repoRules.filter(
         (rule) => rule.triggers.some(
-          (trigger) => trigger === "ready_for_review" || trigger === "new_commits"
+          (trigger) => trigger === "ready_for_review" || trigger === "new_commits" || trigger === "pr_description_matches" || trigger === "comment_matches"
         )
       );
       const issueRules = repoRules.filter(
@@ -15994,47 +16393,81 @@ async function plugin(bb) {
               `bootstrapping ${repo}: recording ${pullRequests.length} open PR(s) as backlog`
             );
           }
+          const pullRequestsByNumber = new Map(
+            pullRequests.map((pullRequest) => [
+              pullRequest.number,
+              pullRequest
+            ])
+          );
+          await ingestCommentEvents(repo, repoRules, pullRequestsByNumber);
+          await processCommentEvents(
+            repo,
+            repoRules,
+            pullRequestsByNumber,
+            maxConcurrent
+          );
           for (const pullRequest of pullRequests) {
-            const triggers = computeTriggers({
+            const lifecycleTriggers = computeTriggers({
               seen: store.getSeen(repo, pullRequest.number),
               isDraft: pullRequest.isDraft,
               headSha: pullRequest.headRefOid,
-              repoBootstrapped
+              repoBootstrapped,
+              createdAt: pullRequest.createdAt,
+              watchStartedAt: Math.min(
+                ...pullRequestRules.map((rule) => rule.createdAt)
+              )
             });
-            let retry = false;
-            if (triggers.length > 0) {
-              await hydrateFiles(pullRequestRules, repo, pullRequest);
-              for (const rule of pullRequestRules) {
-                for (const trigger of triggers) {
-                  const result = evaluateRule(rule, pullRequest, trigger);
-                  if (!result.matched) {
-                    if (result.blockedByTrust) {
-                      recordSkip(rule, pullRequest, result.reason);
-                      announce();
-                    }
-                    continue;
-                  }
-                  const alreadyRan = store.hasRunFor(
-                    rule.id,
-                    repo,
-                    "pull_request",
-                    pullRequest.number,
-                    rule.dedupe === "once_per_head_sha" ? pullRequest.headRefOid : null
-                  );
-                  if (alreadyRan) continue;
-                  if (inFlight >= maxConcurrent) {
-                    retry = true;
-                    bb.log.info(
-                      `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`
+            if (lifecycleTriggers.length === 0) {
+              store.markSeen(
+                repo,
+                pullRequest.number,
+                pullRequest.headRefOid,
+                pullRequest.isDraft,
+                Date.now()
+              );
+              continue;
+            }
+            await hydrateFiles(pullRequestRules, repo, pullRequest);
+            let deferred = false;
+            for (const rule of pullRequestRules) {
+              const triggers = lifecycleTriggers.slice();
+              if (lifecycleTriggers.includes("ready_for_review") && matchesPrDescription(rule, pullRequest)) {
+                triggers.push("pr_description_matches");
+              }
+              for (const trigger of triggers) {
+                const result = evaluateRule(rule, pullRequest, trigger);
+                if (!result.matched) {
+                  if (result.blockedByTrust) {
+                    const eventId2 = triggerEventId(trigger, pullRequest);
+                    recordSkip(
+                      rule,
+                      pullRequest,
+                      result.reason,
+                      trigger,
+                      eventId2
                     );
-                    continue;
+                    announce();
                   }
-                  await dispatch(rule, pullRequest);
+                  continue;
+                }
+                const eventId = triggerEventId(trigger, pullRequest);
+                if (hasAlreadyRun(rule, pullRequest, eventId)) continue;
+                if (inFlight >= maxConcurrent) {
+                  bb.log.info(
+                    `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`
+                  );
+                  deferred = true;
                   break;
                 }
+                await dispatch(rule, pullRequest, {
+                  trigger,
+                  triggerEventId: eventId
+                });
+                break;
               }
+              if (deferred) break;
             }
-            if (!retry) {
+            if (!deferred) {
               store.markSeen(
                 repo,
                 pullRequest.number,
@@ -16075,7 +16508,7 @@ async function plugin(bb) {
               const result = evaluateRule(rule, issue2, triggers[0]);
               if (!result.matched) {
                 if (result.blockedByTrust) {
-                  recordSkip(rule, issue2, result.reason);
+                  recordSkip(rule, issue2, result.reason, "new_issue", null);
                   announce();
                 }
                 continue;
@@ -16095,7 +16528,7 @@ async function plugin(bb) {
                 );
                 continue;
               }
-              await dispatch(rule, issue2);
+              await dispatch(rule, issue2, { trigger: "new_issue" });
             }
             if (!retry) store.markIssueSeen(repo, issue2.number, Date.now());
           }
@@ -16208,11 +16641,14 @@ async function plugin(bb) {
   function saveRule(id, input) {
     const now = Date.now();
     const existing = id === null ? null : store.getRule(id);
+    const hadCommentTrigger = (existing?.triggers.includes("comment_matches") ?? false) && existing?.repo === input.repo;
+    const hasCommentTrigger = input.triggers.includes("comment_matches");
     const rule = {
       id: existing?.id ?? newId("rule"),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
-      ...input
+      ...input,
+      commentTriggerEnabledAt: hasCommentTrigger ? hadCommentTrigger ? existing?.commentTriggerEnabledAt ?? now : now : null
     };
     store.upsertRule(rule);
     if (isDangerousCombination(rule)) {
@@ -16233,7 +16669,13 @@ async function plugin(bb) {
     setRuleEnabled: ({ id, enabled }) => {
       const rule = store.getRule(id);
       if (rule === null) throw new Error("rule not found");
-      store.upsertRule({ ...rule, enabled, updatedAt: Date.now() });
+      const now = Date.now();
+      store.upsertRule({
+        ...rule,
+        enabled,
+        updatedAt: now,
+        commentTriggerEnabledAt: enabled && !rule.enabled && rule.triggers.includes("comment_matches") ? now : rule.commentTriggerEnabledAt
+      });
       announce();
       return { ok: true };
     },
@@ -16292,7 +16734,7 @@ async function plugin(bb) {
       {
         name: "rules-add",
         summary: "Create a rule",
-        usage: "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,\u2026>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--live] [--hidden]"
+        usage: "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--trigger <type,\u2026>] [--keyword <text,\u2026>] [--requester-trust <level>] [--trust <level>] [--live] [--hidden]"
       },
       {
         name: "rules-edit",
@@ -16412,17 +16854,23 @@ ${payload.rules} rule(s)`
           if (skipLabel !== void 0) {
             conditions.push({ kind: "missing_label", labels: skipLabel });
           }
+          const parsedTriggers = list("trigger") ?? existing?.triggers ?? ["ready_for_review"];
+          const keywordTrigger = parsedTriggers.some(
+            (trigger) => ["comment_matches", "pr_description_matches"].includes(trigger)
+          );
           const parsed = ruleInputSchema.parse({
             name: flag("name") ?? existing?.name,
             repo: flag("repo") ?? existing?.repo,
             enabled: has("disabled") ? false : existing?.enabled ?? true,
             mode: has("live") ? "live" : has("shadow") ? "shadow" : existing?.mode ?? "shadow",
-            triggers: list("trigger") ?? existing?.triggers ?? ["ready_for_review"],
+            triggers: parsedTriggers,
+            commentKeywords: list("keyword") ?? existing?.commentKeywords ?? [],
             conditions,
             authorTrust: flag("trust") ?? existing?.authorTrust ?? "write_access",
+            requesterTrust: flag("requester-trust") ?? existing?.requesterTrust ?? "write_access",
             prompt: flag("prompt") ?? existing?.prompt ?? "",
             request: existing?.request ?? null,
-            dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
+            dedupe: flag("dedupe") ?? existing?.dedupe ?? (keywordTrigger ? "once_per_trigger_event" : "once_per_pr"),
             reviewStrategy: flag("strategy") ?? existing?.reviewStrategy ?? "update",
             visibility: has("hidden") ? "hidden" : has("visible") ? "visible" : existing?.visibility ?? "visible"
           });
@@ -16471,10 +16919,13 @@ ${payload.rules} rule(s)`
             announce();
             return ok(`Deleted '${rule.name}'.`);
           }
+          const now = Date.now();
+          const enabled = sub === "enable";
           store.upsertRule({
             ...rule,
-            enabled: sub === "enable",
-            updatedAt: Date.now()
+            enabled,
+            updatedAt: now,
+            commentTriggerEnabledAt: enabled && !rule.enabled && rule.triggers.includes("comment_matches") ? now : rule.commentTriggerEnabledAt
           });
           announce();
           return ok(

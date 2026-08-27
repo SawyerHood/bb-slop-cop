@@ -1,6 +1,11 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { createStore, MIGRATIONS, repairIssueSchema } from "./db";
+import {
+  createStore,
+  MIGRATIONS,
+  repairIssueSchema,
+  repairKeywordSchema,
+} from "./db";
 import type { Run } from "./types";
 
 const databases: Database.Database[] = [];
@@ -13,6 +18,7 @@ function makeStore() {
   const database = new Database(":memory:");
   databases.push(database);
   for (const migration of MIGRATIONS) database.exec(migration);
+  repairKeywordSchema(database);
   return createStore(database);
 }
 
@@ -28,6 +34,8 @@ function makeRun(overrides: Partial<Run> = {}): Run {
     prAuthor: "dana",
     headSha: "",
     status: "reviewing",
+    trigger: "manual",
+    triggerEventId: null,
     mode: "shadow",
     detail: null,
     threadId: "thread_1",
@@ -49,6 +57,8 @@ describe("issue persistence", () => {
 
     repairIssueSchema(database);
     repairIssueSchema(database);
+    repairKeywordSchema(database);
+    repairKeywordSchema(database);
 
     const store = createStore(database);
     store.insertRun(makeRun());

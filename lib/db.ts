@@ -8,6 +8,8 @@ import type {
   Condition,
   Trigger,
   ThreadRequest,
+  CommentTriggerEvent,
+  TriggerCommentSource,
 } from "./types";
 
 // The plugin SDK's database handle is better-sqlite3; typed structurally so
@@ -102,19 +104,47 @@ export const MIGRATIONS: string[] = [
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
    )`,
+  `ALTER TABLE runs ADD COLUMN trigger_event_id TEXT`,
+  `CREATE TABLE IF NOT EXISTS comment_cursors (
+     repo TEXT NOT NULL,
+     source TEXT NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, source)
+   )`,
+  `CREATE TABLE IF NOT EXISTS comment_trigger_events (
+     rule_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     comment_id TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     author TEXT NOT NULL DEFAULT '',
+     author_association TEXT NOT NULL DEFAULT 'NONE',
+     matched_keyword TEXT NOT NULL,
+     url TEXT,
+     created_at INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     detail TEXT,
+     PRIMARY KEY (rule_id, source, comment_id)
+   )`,
+  `CREATE INDEX IF NOT EXISTS idx_comment_events_pending
+     ON comment_trigger_events(repo, status, created_at)`,
+  `ALTER TABLE rules ADD COLUMN comment_trigger_enabled_at INTEGER`,
 ];
 
-export function repairIssueSchema(db: Database): void {
-  const hasTargetKind = db
-    .prepare(`PRAGMA table_info(runs)`)
+function hasColumn(db: Database, table: string, column: string): boolean {
+  return db
+    .prepare(`PRAGMA table_info(${table})`)
     .all()
     .some(
       (row) =>
         typeof row === "object" &&
         row !== null &&
-        Reflect.get(row, "name") === "target_kind",
+        Reflect.get(row, "name") === column,
     );
-  if (!hasTargetKind) {
+}
+
+export function repairIssueSchema(db: Database): void {
+  if (!hasColumn(db, "runs", "target_kind")) {
     db.exec(
       `ALTER TABLE runs ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'pull_request'`,
     );
@@ -129,6 +159,44 @@ export function repairIssueSchema(db: Database): void {
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
    )`);
+}
+
+export function repairKeywordSchema(db: Database): void {
+  const columns = [
+    ["rules", "comment_keywords", `TEXT NOT NULL DEFAULT '[]'`],
+    ["rules", "requester_trust", `TEXT NOT NULL DEFAULT 'write_access'`],
+    ["runs", "trigger", `TEXT NOT NULL DEFAULT 'manual'`],
+    ["runs", "trigger_event_id", `TEXT`],
+    ["rules", "comment_trigger_enabled_at", `INTEGER`],
+  ] as const;
+  for (const [table, column, definition] of columns) {
+    if (!hasColumn(db, table, column)) {
+      db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+    }
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_cursors (
+     repo TEXT NOT NULL,
+     source TEXT NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, source)
+   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS comment_trigger_events (
+     rule_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     comment_id TEXT NOT NULL,
+     repo TEXT NOT NULL,
+     pr_number INTEGER NOT NULL,
+     author TEXT NOT NULL DEFAULT '',
+     author_association TEXT NOT NULL DEFAULT 'NONE',
+     matched_keyword TEXT NOT NULL,
+     url TEXT,
+     created_at INTEGER NOT NULL,
+     status TEXT NOT NULL DEFAULT 'pending',
+     detail TEXT,
+     PRIMARY KEY (rule_id, source, comment_id)
+   )`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_comment_events_pending
+     ON comment_trigger_events(repo, status, created_at)`);
 }
 
 type Row = Record<string, unknown>;
@@ -158,8 +226,22 @@ export function rowToRule(row: Row): Rule {
     enabled: num(row, "enabled") === 1,
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     triggers: parseJson<Trigger[]>(row.triggers, ["ready_for_review"]),
+    commentKeywords: parseJson<string[]>(row.comment_keywords, []),
     conditions: parseJson<Condition[]>(row.conditions, []),
-    authorTrust: text(row, "author_trust", "write_access") as Rule["authorTrust"],
+    authorTrust: text(
+      row,
+      "author_trust",
+      "write_access",
+    ) as Rule["authorTrust"],
+    requesterTrust: text(
+      row,
+      "requester_trust",
+      "write_access",
+    ) as Rule["requesterTrust"],
+    commentTriggerEnabledAt:
+      typeof row.comment_trigger_enabled_at === "number"
+        ? row.comment_trigger_enabled_at
+        : null,
     prompt: text(row, "prompt"),
     request: parseJson<ThreadRequest | null>(row.request, null),
     dedupe: text(row, "dedupe", "once_per_pr") as Rule["dedupe"],
@@ -168,9 +250,8 @@ export function rowToRule(row: Row): Rule {
       "review_strategy",
       "update",
     ) as Rule["reviewStrategy"],
-    visibility: text(row, "visibility", "visible") === "hidden"
-      ? "hidden"
-      : "visible",
+    visibility:
+      text(row, "visibility", "visible") === "hidden" ? "hidden" : "visible",
     createdAt: num(row, "created_at"),
     updatedAt: num(row, "updated_at"),
   };
@@ -190,6 +271,9 @@ export function rowToRun(row: Row): Run {
     prTitle: text(row, "pr_title"),
     prAuthor: text(row, "pr_author"),
     headSha: text(row, "head_sha"),
+    trigger: text(row, "trigger", "manual") as Trigger,
+    triggerEventId:
+      typeof row.trigger_event_id === "string" ? row.trigger_event_id : null,
     status: text(row, "status", "dispatched") as RunStatus,
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     detail: typeof row.detail === "string" ? row.detail : null,
@@ -203,9 +287,9 @@ export function rowToRun(row: Row): Run {
 export function createStore(db: Database) {
   return {
     listRules(): Rule[] {
-      return (db.prepare(`SELECT * FROM rules ORDER BY name`).all() as Row[]).map(
-        rowToRule,
-      );
+      return (
+        db.prepare(`SELECT * FROM rules ORDER BY name`).all() as Row[]
+      ).map(rowToRule);
     },
 
     getRule(id: string): Rule | null {
@@ -224,14 +308,18 @@ export function createStore(db: Database) {
 
     upsertRule(rule: Rule): void {
       db.prepare(
-        `INSERT INTO rules (id, name, repo, enabled, mode, triggers, conditions,
-           author_trust, prompt, request, dedupe, review_strategy, visibility,
-           created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO rules (id, name, repo, enabled, mode, triggers,
+           comment_keywords, conditions, author_trust, requester_trust,
+           comment_trigger_enabled_at, prompt, request, dedupe, review_strategy,
+           visibility, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name, repo = excluded.repo, enabled = excluded.enabled,
            mode = excluded.mode, triggers = excluded.triggers,
+           comment_keywords = excluded.comment_keywords,
            conditions = excluded.conditions, author_trust = excluded.author_trust,
+           requester_trust = excluded.requester_trust,
+           comment_trigger_enabled_at = excluded.comment_trigger_enabled_at,
            prompt = excluded.prompt, request = excluded.request,
            dedupe = excluded.dedupe, review_strategy = excluded.review_strategy,
            visibility = excluded.visibility, updated_at = excluded.updated_at`,
@@ -242,8 +330,11 @@ export function createStore(db: Database) {
         rule.enabled ? 1 : 0,
         rule.mode,
         JSON.stringify(rule.triggers),
+        JSON.stringify(rule.commentKeywords),
         JSON.stringify(rule.conditions),
         rule.authorTrust,
+        rule.requesterTrust,
+        rule.commentTriggerEnabledAt,
         rule.prompt,
         rule.request === null ? null : JSON.stringify(rule.request),
         rule.dedupe,
@@ -255,6 +346,9 @@ export function createStore(db: Database) {
     },
 
     deleteRule(id: string): void {
+      db.prepare(`DELETE FROM comment_trigger_events WHERE rule_id = ?`).run(
+        id,
+      );
       db.prepare(`DELETE FROM rules WHERE id = ?`).run(id);
     },
 
@@ -282,10 +376,10 @@ export function createStore(db: Database) {
 
     insertRun(run: Run): void {
       db.prepare(
-        `INSERT INTO runs (id, rule_id, rule_name, repo, target_kind, pr_number, pr_title,
-           pr_author, head_sha, status, mode, detail, thread_id, comment_count,
-           started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO runs (id, rule_id, rule_name, repo, target_kind, pr_number,
+           pr_title, pr_author, head_sha, trigger, trigger_event_id, status, mode,
+           detail, thread_id, comment_count, started_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         run.id,
         run.ruleId,
@@ -296,6 +390,8 @@ export function createStore(db: Database) {
         run.prTitle,
         run.prAuthor,
         run.headSha,
+        run.trigger,
+        run.triggerEventId,
         run.status,
         run.mode,
         run.detail,
@@ -358,25 +454,34 @@ export function createStore(db: Database) {
       targetKind: Run["targetKind"],
       prNumber: number,
       headSha: string | null,
+      triggerEventId: string | null = null,
     ): boolean {
       const row =
-        headSha === null
+        triggerEventId !== null
           ? db
               .prepare(
                 `SELECT 1 AS hit FROM runs
+                 WHERE rule_id = ? AND trigger_event_id = ?
+                   AND status NOT IN ('skipped', 'failed') LIMIT 1`,
+              )
+              .get(ruleId, triggerEventId)
+          : headSha === null
+            ? db
+                .prepare(
+                  `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
                    AND target_kind = ?
                    AND status NOT IN ('skipped', 'failed') LIMIT 1`,
-              )
-              .get(ruleId, repo, prNumber, targetKind)
-          : db
-              .prepare(
-                `SELECT 1 AS hit FROM runs
+                )
+                .get(ruleId, repo, prNumber, targetKind)
+            : db
+                .prepare(
+                  `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
                    AND target_kind = ?
                    AND status NOT IN ('skipped', 'failed') LIMIT 1`,
-              )
-              .get(ruleId, repo, prNumber, headSha, targetKind);
+                )
+                .get(ruleId, repo, prNumber, headSha, targetKind);
       return row !== undefined;
     },
 
@@ -496,6 +601,88 @@ export function createStore(db: Database) {
          ON CONFLICT(repo, issue_number) DO UPDATE SET
            updated_at = excluded.updated_at`,
       ).run(repo, issueNumber, now);
+    },
+
+    getCommentCursor(
+      repo: string,
+      source: TriggerCommentSource,
+    ): number | null {
+      const row = db
+        .prepare(
+          `SELECT updated_at FROM comment_cursors WHERE repo = ? AND source = ?`,
+        )
+        .get(repo, source) as Row | undefined;
+      return row === undefined ? null : num(row, "updated_at");
+    },
+
+    setCommentCursor(
+      repo: string,
+      source: TriggerCommentSource,
+      updatedAt: number,
+    ): void {
+      db.prepare(
+        `INSERT INTO comment_cursors (repo, source, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(repo, source) DO UPDATE SET updated_at = excluded.updated_at`,
+      ).run(repo, source, updatedAt);
+    },
+
+    enqueueCommentEvent(event: CommentTriggerEvent): void {
+      db.prepare(
+        `INSERT OR IGNORE INTO comment_trigger_events
+           (rule_id, source, comment_id, repo, pr_number, author,
+            author_association, matched_keyword, url, created_at, status, detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        event.ruleId,
+        event.source,
+        event.commentId,
+        event.repo,
+        event.prNumber,
+        event.author,
+        event.authorAssociation,
+        event.matchedKeyword,
+        event.url,
+        event.createdAt,
+        event.status,
+        event.detail,
+      );
+    },
+
+    listPendingCommentEvents(repo: string): CommentTriggerEvent[] {
+      const rows = db
+        .prepare(
+          `SELECT * FROM comment_trigger_events
+           WHERE repo = ? AND status = 'pending'
+           ORDER BY created_at, comment_id`,
+        )
+        .all(repo) as Row[];
+      return rows.map((row) => ({
+        ruleId: text(row, "rule_id"),
+        source: text(row, "source") as TriggerCommentSource,
+        commentId: text(row, "comment_id"),
+        repo: text(row, "repo"),
+        prNumber: num(row, "pr_number"),
+        author: text(row, "author"),
+        authorAssociation: text(row, "author_association", "NONE"),
+        matchedKeyword: text(row, "matched_keyword"),
+        url: typeof row.url === "string" ? row.url : null,
+        createdAt: num(row, "created_at"),
+        status: "pending",
+        detail: typeof row.detail === "string" ? row.detail : null,
+      }));
+    },
+
+    finishCommentEvent(
+      ruleId: string,
+      source: TriggerCommentSource,
+      commentId: string,
+      status: "processed" | "ignored",
+      detail: string | null,
+    ): void {
+      db.prepare(
+        `UPDATE comment_trigger_events SET status = ?, detail = ?
+         WHERE rule_id = ? AND source = ? AND comment_id = ?`,
+      ).run(status, detail, ruleId, source, commentId);
     },
   };
 }
