@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { createStore, MIGRATIONS } from "./db";
+import { createStore, MIGRATIONS, repairIssueSchema } from "./db";
 import type { Run } from "./types";
 
 const databases: Database.Database[] = [];
@@ -39,6 +39,27 @@ function makeRun(overrides: Partial<Run> = {}): Run {
 }
 
 describe("issue persistence", () => {
+  it("repairs issue tables after a migration index collision", () => {
+    const database = new Database(":memory:");
+    databases.push(database);
+    for (const migration of MIGRATIONS.slice(0, 10)) database.exec(migration);
+    database.exec(
+      `ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'manual'`,
+    );
+
+    repairIssueSchema(database);
+    repairIssueSchema(database);
+
+    const store = createStore(database);
+    store.insertRun(makeRun());
+    store.markIssueBootstrapped("acme/widgets", 100);
+    store.markIssueSeen("acme/widgets", 42, 100);
+
+    expect(store.getRun("run_1")?.targetKind).toBe("issue");
+    expect(store.isIssueBootstrapped("acme/widgets")).toBe(true);
+    expect(store.hasSeenIssue("acme/widgets", 42)).toBe(true);
+  });
+
   it("round-trips the target kind and keeps PR dedupe separate", () => {
     const store = makeStore();
     store.insertRun(makeRun());

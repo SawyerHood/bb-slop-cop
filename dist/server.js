@@ -14621,6 +14621,13 @@ function toIssue(raw) {
     updatedAt: typeof row.updated_at === "string" ? row.updated_at : ""
   };
 }
+function toIssueNumbers(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((value) => {
+    const number4 = asRecord(value).number;
+    return typeof number4 === "number" && Number.isSafeInteger(number4) && number4 > 0 ? [number4] : [];
+  });
+}
 function createGhClient(ghPath, timeoutMs = 3e4) {
   const apiRows = async (endpoint) => {
     const stdout = await run(
@@ -14635,9 +14642,7 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
   const api = async (endpoint) => (await apiRows(endpoint)).map(toComment);
   return {
     async listOpenPullRequests(repo) {
-      const rows = await apiRows(
-        `repos/${repo}/pulls?state=open&per_page=100`
-      );
+      const rows = await apiRows(`repos/${repo}/pulls?state=open&per_page=100`);
       return rows.map(toPullRequest);
     },
     async getPullRequest(repo, number4) {
@@ -14648,11 +14653,24 @@ function createGhClient(ghPath, timeoutMs = 3e4) {
       );
       return toPullRequest(JSON.parse(stdout));
     },
-    async listOpenIssues(repo) {
-      const rows = await apiRows(
-        `repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=100`
+    async listOpenIssueNumbers(repo) {
+      const stdout = await run(
+        ghPath,
+        [
+          "issue",
+          "list",
+          "--repo",
+          repo,
+          "--state",
+          "open",
+          "--limit",
+          "1000",
+          "--json",
+          "number"
+        ],
+        timeoutMs
       );
-      return rows.map(toIssue).filter((issue2) => issue2 !== null);
+      return toIssueNumbers(JSON.parse(stdout));
     },
     async getIssue(repo, number4) {
       const stdout = await run(
@@ -14780,6 +14798,26 @@ var MIGRATIONS = [
      bootstrapped_at INTEGER NOT NULL
    )`
 ];
+function repairIssueSchema(db) {
+  const hasTargetKind = db.prepare(`PRAGMA table_info(runs)`).all().some(
+    (row) => typeof row === "object" && row !== null && Reflect.get(row, "name") === "target_kind"
+  );
+  if (!hasTargetKind) {
+    db.exec(
+      `ALTER TABLE runs ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'pull_request'`
+    );
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS seen_issues (
+     repo TEXT NOT NULL,
+     issue_number INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, issue_number)
+   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS watched_issue_repos (
+     repo TEXT PRIMARY KEY,
+     bootstrapped_at INTEGER NOT NULL
+   )`);
+}
 function text(row, key, fallback = "") {
   const value = row[key];
   return typeof value === "string" ? value : fallback;
@@ -14805,7 +14843,11 @@ function rowToRule(row) {
     mode: text(row, "mode", "shadow") === "live" ? "live" : "shadow",
     triggers: parseJson(row.triggers, ["ready_for_review"]),
     conditions: parseJson(row.conditions, []),
-    authorTrust: text(row, "author_trust", "write_access"),
+    authorTrust: text(
+      row,
+      "author_trust",
+      "write_access"
+    ),
     prompt: text(row, "prompt"),
     request: parseJson(row.request, null),
     dedupe: text(row, "dedupe", "once_per_pr"),
@@ -14842,9 +14884,7 @@ function rowToRun(row) {
 function createStore(db) {
   return {
     listRules() {
-      return db.prepare(`SELECT * FROM rules ORDER BY name`).all().map(
-        rowToRule
-      );
+      return db.prepare(`SELECT * FROM rules ORDER BY name`).all().map(rowToRule);
     },
     getRule(id) {
       const row = db.prepare(`SELECT * FROM rules WHERE id = ?`).get(id);
@@ -15793,6 +15833,7 @@ async function plugin(bb) {
   });
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
+  repairIssueSchema(db);
   const store = createStore(db);
   let gh = createGhClient("gh");
   let ghLogin = null;
@@ -16012,23 +16053,24 @@ async function plugin(bb) {
       }
       if (issueRules.length > 0) {
         try {
-          const issues = await gh.listOpenIssues(repo);
+          const issueNumbers = await gh.listOpenIssueNumbers(repo);
           const repoBootstrapped = store.isIssueBootstrapped(repo);
           if (!repoBootstrapped) {
             bb.log.info(
-              `bootstrapping ${repo}: recording ${issues.length} open issue(s) as backlog`
+              `bootstrapping ${repo}: recording ${issueNumbers.length} open issue(s) as backlog`
             );
           }
-          for (const issue2 of issues) {
+          for (const issueNumber of issueNumbers) {
             const triggers = computeIssueTriggers({
-              seen: store.hasSeenIssue(repo, issue2.number),
+              seen: store.hasSeenIssue(repo, issueNumber),
               repoBootstrapped
             });
             let retry = false;
             if (triggers.length === 0) {
-              store.markIssueSeen(repo, issue2.number, Date.now());
+              store.markIssueSeen(repo, issueNumber, Date.now());
               continue;
             }
+            const issue2 = await gh.getIssue(repo, issueNumber);
             for (const rule of issueRules) {
               const result = evaluateRule(rule, issue2, triggers[0]);
               if (!result.matched) {

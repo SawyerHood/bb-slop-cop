@@ -17,7 +17,7 @@ import {
 } from "./matcher";
 import { buildPrompt } from "./dispatch";
 import { verifyLive, verifyShadow } from "./verify";
-import { toIssue, type GhClient, type GhComment } from "./gh";
+import { toIssue, toIssueNumbers, type GhClient, type GhComment } from "./gh";
 import type { GitHubIssue, PullRequest, Rule } from "./types";
 import { resolveThreadSectionId } from "./sections";
 import { expandHome } from "./paths";
@@ -96,6 +96,17 @@ describe("GitHub issue mapping", () => {
       authorAssociation: "MEMBER",
     });
     expect(toIssue({ number: 78, pull_request: { url: "x" } })).toBeNull();
+  });
+
+  it("reads issue numbers from the GitHub CLI issue list", () => {
+    expect(
+      toIssueNumbers([
+        { number: 23 },
+        { number: 24 },
+        { number: "25" },
+        { number: 0 },
+      ]),
+    ).toEqual([23, 24]);
   });
 });
 
@@ -507,7 +518,7 @@ function fakeGh(parts: {
   return {
     listOpenPullRequests: async () => [],
     getPullRequest: async () => makePr(),
-    listOpenIssues: async () => [],
+    listOpenIssueNumbers: async () => [],
     getIssue: async () => makeIssue(),
     listFiles: async () => [],
     listIssueComments: async () => parts.issues ?? [],
