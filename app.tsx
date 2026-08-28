@@ -16,7 +16,7 @@ import {
   useBbNavigate,
   useRealtime,
   useRpc,
-} from "@bb/plugin-sdk/app";
+} from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { rpcContract } from "./server";
 import { Button } from "@/components/ui/button";
@@ -52,6 +52,7 @@ interface RunView {
   id: string;
   ruleName: string;
   repo: string;
+  targetKind: "pull_request" | "issue";
   prNumber: number;
   prTitle: string;
   prAuthor: string;
@@ -190,7 +191,7 @@ function RulesList({
       <div className="rounded-lg border border-dashed border-border p-8 text-center">
         <p className="text-sm font-medium">No rules yet</p>
         <p className="mt-1 text-xs text-muted-foreground">
-          A rule watches one repo and reviews PRs that match it. New rules start
+          A rule watches one repo for pull requests or issues. New rules start
           in shadow mode — they run but post nothing until you promote them.
         </p>
         <Button size="sm" className="mt-4" onClick={onNew}>
@@ -282,14 +283,22 @@ function extractPromptText(input: unknown): string {
  * would make bypassing the trust gate as cheap as an ordinary run, which
  * defeats the point of having one.
  */
-function RunOnPr({ rule }: { rule: RuleView }) {
+function RunOnTarget({ rule }: { rule: RuleView }) {
   const rpc = useRpc<typeof rpcContract>();
-  const [pr, setPr] = useState("");
+  const supportsPullRequests = rule.triggers.some(
+    (trigger) => trigger === "ready_for_review" || trigger === "new_commits",
+  );
+  const supportsIssues = rule.triggers.includes("new_issue");
+  const [targetKind, setTargetKind] = useState<"pull_request" | "issue">(
+    supportsIssues && !supportsPullRequests ? "issue" : "pull_request",
+  );
+  const [number, setNumber] = useState("");
   const [busy, setBusy] = useState(false);
   const [blocked, setBlocked] = useState<string | null>(null);
 
-  const prNumber = Number.parseInt(pr, 10);
-  const valid = Number.isFinite(prNumber) && prNumber > 0;
+  const targetNumber = Number.parseInt(number, 10);
+  const valid = Number.isFinite(targetNumber) && targetNumber > 0;
+  const targetLabel = targetKind === "issue" ? "issue" : "PR";
 
   const run = useCallback(
     async (force: boolean) => {
@@ -297,7 +306,8 @@ function RunOnPr({ rule }: { rule: RuleView }) {
       try {
         const result = await rpc.call("dispatchNow", {
           ruleId: rule.id,
-          prNumber,
+          prNumber: targetNumber,
+          targetKind,
           force,
         });
         if (result.blockedReason !== null) {
@@ -305,11 +315,11 @@ function RunOnPr({ rule }: { rule: RuleView }) {
           return;
         }
         setBlocked(null);
-        setPr("");
+        setNumber("");
         toast.success(
           force
-            ? `Forced ${rule.name} on #${prNumber} — the rule would have skipped it`
-            : `Running ${rule.name} on #${prNumber}`,
+            ? `Forced ${rule.name} on ${targetLabel} #${targetNumber}`
+            : `Running ${rule.name} on ${targetLabel} #${targetNumber}`,
         );
       } catch (error) {
         toast.error(error instanceof Error ? error.message : String(error));
@@ -317,23 +327,35 @@ function RunOnPr({ rule }: { rule: RuleView }) {
         setBusy(false);
       }
     },
-    [prNumber, rpc, rule.id, rule.name],
+    [rpc, rule.id, rule.name, targetKind, targetLabel, targetNumber],
   );
 
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border p-3">
       <div className="flex items-center gap-2">
         <span className="text-xs font-semibold text-muted-foreground">
-          Run on a PR now
+          Run now
         </span>
         <span className="flex-1" />
+        {supportsPullRequests && supportsIssues ? (
+          <select
+            value={targetKind}
+            onChange={(event) =>
+              setTargetKind(event.target.value as "pull_request" | "issue")
+            }
+            className="h-7 rounded-md border border-input bg-card px-2 text-xs"
+          >
+            <option value="pull_request">PR</option>
+            <option value="issue">Issue</option>
+          </select>
+        ) : null}
         <Input
-          value={pr}
+          value={number}
           onChange={(event) => {
-            setPr(event.target.value.replace(/[^0-9]/g, ""));
+            setNumber(event.target.value.replace(/[^0-9]/g, ""));
             setBlocked(null);
           }}
-          placeholder="PR #"
+          placeholder={`${targetLabel} #`}
           className="h-7 w-24"
         />
         <Button
@@ -347,7 +369,9 @@ function RunOnPr({ rule }: { rule: RuleView }) {
       </div>
       {blocked !== null ? (
         <div className="rounded-md bg-surface-attention p-2 text-xs leading-relaxed">
-          <b className="text-warning-text">This rule would skip #{prNumber}:</b>{" "}
+          <b className="text-warning-text">
+            This rule would skip {targetLabel} #{targetNumber}:
+          </b>{" "}
           {blocked}
           <div className="mt-2 flex items-center gap-2">
             <Button
@@ -360,8 +384,8 @@ function RunOnPr({ rule }: { rule: RuleView }) {
             </Button>
             <span className="text-subtle-foreground">
               {rule.mode === "live"
-                ? "Posts publicly, and the agent runs this PR's code."
-                : "The agent still checks out and runs this PR's code."}
+                ? "This action can write to GitHub."
+                : "The agent will process this target without a public post."}
             </span>
           </div>
         </div>
@@ -426,7 +450,11 @@ function RuleEditor({
     return list;
   }, [pathGlobs, baseBranch]);
 
-  const dangerous = trust === "anyone" && mode === "live";
+  const listensForPullRequests = triggers.some(
+    (trigger) => trigger === "ready_for_review" || trigger === "new_commits",
+  );
+  const dangerous =
+    trust === "anyone" && mode === "live" && listensForPullRequests;
 
   const handleSubmit = useCallback(
     async (request: unknown) => {
@@ -448,7 +476,11 @@ function RuleEditor({
           repo: repo.trim(),
           enabled: rule?.enabled ?? true,
           mode: mode as "shadow" | "live",
-          triggers: triggers as ("ready_for_review" | "new_commits")[],
+          triggers: triggers as (
+            | "ready_for_review"
+            | "new_commits"
+            | "new_issue"
+          )[],
           conditions: conditions as never,
           authorTrust: trust as "write_access",
           prompt: extractPromptText(input),
@@ -509,7 +541,7 @@ function RuleEditor({
           Trigger
         </span>
         <div className="flex gap-1.5">
-          {["ready_for_review", "new_commits"].map((trigger) => (
+          {["ready_for_review", "new_commits", "new_issue"].map((trigger) => (
             <button
               key={trigger}
               type="button"
@@ -535,7 +567,7 @@ function RuleEditor({
       <div className="grid grid-cols-2 gap-3">
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-semibold text-muted-foreground">
-            Changed paths match
+            Changed paths match (PR only)
           </span>
           <Input
             value={pathGlobs}
@@ -545,7 +577,7 @@ function RuleEditor({
         </label>
         <label className="flex flex-col gap-1.5">
           <span className="text-xs font-semibold text-muted-foreground">
-            Base branch
+            Base branch (PR only)
           </span>
           <Input
             value={baseBranch}
@@ -558,7 +590,7 @@ function RuleEditor({
       <div className="rounded-lg border border-border bg-surface-recessed p-3">
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold">
-            Only review trusted authors
+            Only handle trusted authors
           </span>
           <span className="flex-1" />
           <select
@@ -580,17 +612,16 @@ function RuleEditor({
         </p>
         {trust === "anyone" ? (
           <p className="mt-2 rounded-md bg-surface-attention p-2 text-xs leading-relaxed">
-            <b className="text-warning-text">!</b> The agent will run{" "}
-            <code className="font-mono">gh pr checkout</code> on unvetted code
-            from strangers, and the diff itself can carry prompt injection. Pair
-            this with a restricted permission mode in the composer below.
+            <b className="text-warning-text">!</b> Pull request rules can check
+            out unvetted code from strangers. Issue text can also carry prompt
+            injection. Use the narrowest suitable permission mode below.
           </p>
         ) : null}
       </div>
 
       <div className="flex flex-col gap-1.5">
         <span className="text-xs font-semibold text-muted-foreground">
-          Review instructions &amp; agent
+          Agent instructions &amp; configuration
           <span className="ml-1.5 font-normal text-subtle-foreground">
             the composer&apos;s submit button saves the rule — it never starts a
             thread here
@@ -606,13 +637,13 @@ function RuleEditor({
           defaultServiceTier={saved?.serviceTier as never}
           defaultPermissionMode={saved?.permissionMode as never}
           defaultEnvironment={saved?.environment as never}
-          placeholder="Tell the agent what to look for, and how to post its review…"
+          placeholder="Tell the agent how to handle the pull request or issue…"
           layout="document"
           onSubmit={handleSubmit}
         />
       </div>
 
-      {rule !== null ? <RunOnPr rule={rule} /> : null}
+      {rule !== null ? <RunOnTarget rule={rule} /> : null}
 
       <div className="flex items-center gap-2 border-t border-border pt-3">
         <div className="flex gap-1.5">
@@ -629,7 +660,7 @@ function RuleEditor({
             >
               {value === "shadow"
                 ? "Shadow (post nothing)"
-                : "Live (post to PR)"}
+                : "Live (post to GitHub)"}
             </button>
           ))}
         </div>
@@ -704,7 +735,7 @@ function Activity({ runs }: { runs: RunView[] }) {
   if (runs.length === 0) {
     return (
       <p className="py-8 text-center text-xs text-muted-foreground">
-        No runs yet. Rules dispatch when a PR is marked ready for review.
+        No runs yet. Rules dispatch for new issues or matching pull requests.
       </p>
     );
   }
@@ -727,7 +758,7 @@ function Activity({ runs }: { runs: RunView[] }) {
             <div className="min-w-0 flex-1">
               <p className="text-sm">
                 <span className="font-mono text-pr-merged">
-                  #{run.prNumber}
+                  {run.targetKind === "issue" ? "issue" : "PR"} #{run.prNumber}
                 </span>{" "}
                 <span className="font-medium">{run.prTitle}</span>
               </p>

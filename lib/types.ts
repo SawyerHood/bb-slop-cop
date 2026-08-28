@@ -63,9 +63,13 @@ export type Condition = z.infer<typeof conditionSchema>;
 export const triggerSchema = z.enum([
   "ready_for_review",
   "new_commits",
+  "new_issue",
   "manual",
 ]);
 export type Trigger = z.infer<typeof triggerSchema>;
+
+export const targetKindSchema = z.enum(["pull_request", "issue"]);
+export type TargetKind = z.infer<typeof targetKindSchema>;
 
 /**
  * The composer's resolved selections, stored verbatim and replayed at dispatch.
@@ -161,6 +165,7 @@ export interface Run {
   ruleId: string;
   ruleName: string;
   repo: string;
+  targetKind: TargetKind;
   prNumber: number;
   prTitle: string;
   prAuthor: string;
@@ -176,6 +181,7 @@ export interface Run {
 
 /** The PR fields SlopCop reads, as returned by `gh pr list --json`. */
 export interface PullRequest {
+  kind: "pull_request";
   number: number;
   title: string;
   isDraft: boolean;
@@ -188,3 +194,18 @@ export interface PullRequest {
   isCrossRepository: boolean;
   updatedAt: string;
 }
+
+/** The issue fields SlopCop reads from GitHub's REST API. */
+export interface GitHubIssue {
+  kind: "issue";
+  number: number;
+  title: string;
+  body: string;
+  author: { login: string } | null;
+  authorAssociation: AuthorAssociation | string;
+  labels: { name: string }[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type GitHubTarget = PullRequest | GitHubIssue;

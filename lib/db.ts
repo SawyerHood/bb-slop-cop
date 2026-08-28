@@ -90,6 +90,17 @@ export const MIGRATIONS: string[] = [
      repo TEXT PRIMARY KEY,
      bootstrapped_at INTEGER NOT NULL
    )`,
+  `ALTER TABLE runs ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'pull_request'`,
+  `CREATE TABLE IF NOT EXISTS seen_issues (
+     repo TEXT NOT NULL,
+     issue_number INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, issue_number)
+   )`,
+  `CREATE TABLE IF NOT EXISTS watched_issue_repos (
+     repo TEXT PRIMARY KEY,
+     bootstrapped_at INTEGER NOT NULL
+   )`,
 ];
 
 type Row = Record<string, unknown>;
@@ -143,6 +154,10 @@ export function rowToRun(row: Row): Run {
     ruleId: text(row, "rule_id"),
     ruleName: text(row, "rule_name"),
     repo: text(row, "repo"),
+    targetKind:
+      text(row, "target_kind", "pull_request") === "issue"
+        ? "issue"
+        : "pull_request",
     prNumber: num(row, "pr_number"),
     prTitle: text(row, "pr_title"),
     prAuthor: text(row, "pr_author"),
@@ -239,15 +254,16 @@ export function createStore(db: Database) {
 
     insertRun(run: Run): void {
       db.prepare(
-        `INSERT INTO runs (id, rule_id, rule_name, repo, pr_number, pr_title,
+        `INSERT INTO runs (id, rule_id, rule_name, repo, target_kind, pr_number, pr_title,
            pr_author, head_sha, status, mode, detail, thread_id, comment_count,
            started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         run.id,
         run.ruleId,
         run.ruleName,
         run.repo,
+        run.targetKind,
         run.prNumber,
         run.prTitle,
         run.prAuthor,
@@ -307,10 +323,11 @@ export function createStore(db: Database) {
       return row === undefined ? null : rowToRun(row);
     },
 
-    /** Dedupe: has this rule already run for this PR (or this exact commit)? */
+    /** Dedupe: has this rule already run for this target or exact PR commit? */
     hasRunFor(
       ruleId: string,
       repo: string,
+      targetKind: Run["targetKind"],
       prNumber: number,
       headSha: string | null,
     ): boolean {
@@ -320,16 +337,18 @@ export function createStore(db: Database) {
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ?
+                   AND target_kind = ?
                    AND status NOT IN ('skipped', 'failed') LIMIT 1`,
               )
-              .get(ruleId, repo, prNumber)
+              .get(ruleId, repo, prNumber, targetKind)
           : db
               .prepare(
                 `SELECT 1 AS hit FROM runs
                  WHERE rule_id = ? AND repo = ? AND pr_number = ? AND head_sha = ?
+                   AND target_kind = ?
                    AND status NOT IN ('skipped', 'failed') LIMIT 1`,
               )
-              .get(ruleId, repo, prNumber, headSha);
+              .get(ruleId, repo, prNumber, headSha, targetKind);
       return row !== undefined;
     },
 
@@ -416,6 +435,39 @@ export function createStore(db: Database) {
            head_sha = excluded.head_sha, was_draft = excluded.was_draft,
            updated_at = excluded.updated_at`,
       ).run(repo, prNumber, headSha, wasDraft ? 1 : 0, now);
+    },
+
+    isIssueBootstrapped(repo: string): boolean {
+      return (
+        db
+          .prepare(`SELECT 1 AS hit FROM watched_issue_repos WHERE repo = ?`)
+          .get(repo) !== undefined
+      );
+    },
+
+    markIssueBootstrapped(repo: string, now: number): void {
+      db.prepare(
+        `INSERT INTO watched_issue_repos (repo, bootstrapped_at) VALUES (?, ?)
+         ON CONFLICT(repo) DO NOTHING`,
+      ).run(repo, now);
+    },
+
+    hasSeenIssue(repo: string, issueNumber: number): boolean {
+      return (
+        db
+          .prepare(
+            `SELECT 1 AS hit FROM seen_issues WHERE repo = ? AND issue_number = ?`,
+          )
+          .get(repo, issueNumber) !== undefined
+      );
+    },
+
+    markIssueSeen(repo: string, issueNumber: number, now: number): void {
+      db.prepare(
+        `INSERT INTO seen_issues (repo, issue_number, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(repo, issue_number) DO UPDATE SET
+           updated_at = excluded.updated_at`,
+      ).run(repo, issueNumber, now);
     },
   };
 }

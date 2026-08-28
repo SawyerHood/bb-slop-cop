@@ -1,13 +1,12 @@
 ---
 name: slopcop
-description: Configure automated PR review rules with the `bb slopcop` CLI. Use when asked to set up, change, inspect, or debug automatic pull-request reviews — creating a review rule for a repo, changing what a rule looks for, restricting which authors get reviewed, checking why a PR was or was not reviewed, or reading what a shadow-mode rule would have posted.
+description: Configure automated GitHub issue and PR rules with the `bb slopcop` CLI. Use for new-issue listeners, pull-request reviews, rule changes, author restrictions, match checks, and shadow results.
 ---
 
-# SlopCop — automated PR review rules
+# SlopCop — automated GitHub issue and PR rules
 
-A **rule** watches one GitHub repo and dispatches a BB agent to review PRs that
-match it. Rules are configured entirely from the CLI, so you can set them up on
-the user's behalf.
+A **rule** watches one GitHub repo and dispatches a BB agent for matching pull
+requests or new issues. Configure rules from the CLI on the user's behalf.
 
 ## Safety defaults — do not loosen without being asked
 
@@ -44,6 +43,10 @@ Flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy
 --trigger --live --shadow --disabled --hidden --visible`.
 
+Use `--trigger new_issue` to listen for new issues. The first poll records the
+open backlog. Labels, authors, and titles can filter issues. PR-only conditions
+do not restrict issue events.
+
 `--hidden` spawns review threads with `visibility: "hidden"`: they stay out of
 sidebar organization and raise no unread or notification attention. Right for a
 rule that fires often. Default is `--visible`, so a new rule is watchable while
@@ -66,10 +69,10 @@ is no read-only mode, which is why the trust gate is the real protection.
 ```sh
 bb slopcop rules                       # list rules
 bb slopcop status                      # gh auth, watched repos, poll interval
-bb slopcop check <rule> <pr-number>    # dry run: match or the exact reason it did not
+bb slopcop check <rule> <number> [--issue]
 bb slopcop runs [--rule <r>] [--json]  # recent runs and their status
 bb slopcop show [run-id]               # the review body a run produced
-bb slopcop dispatch <rule> <pr> [--force]
+bb slopcop dispatch <rule> <number> [--issue] [--force]
 bb slopcop rules edit|enable|disable|rm <rule>
 ```
 

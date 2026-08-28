@@ -1,16 +1,15 @@
 # 🚨 SlopCop
 
-A [BB](https://github.com/ymichael/bb) plugin that automatically reviews pull requests.
+A [BB](https://github.com/ymichael/bb) plugin that handles new GitHub issues and reviews pull requests.
 
-Define **rules** — a name, a prompt, a repo, and some conditions — and SlopCop watches
-GitHub for PRs that match, dispatches a BB agent to review them, and posts the review
-with the `gh` CLI. Rules are configurable from a side panel or from the CLI, so other
-BB agents can set them up for you.
+Define **rules** with a prompt, repository, triggers, and conditions. SlopCop watches
+GitHub, dispatches a BB agent, and verifies its response with the `gh` CLI. A rule can
+listen for new issues, ready pull requests, new commits, or any combination.
 
 ```
 GitHub  ←(gh)—  watcher  →  rule matcher  →  dispatcher  →  BB agent
                    │                                          │
-             plugin SQLite  ←—— verified runs ——  gh pr review / gh pr comment
+             plugin SQLite  ←—— verified runs ——  gh issue / gh pr
 ```
 
 ## Install
@@ -41,6 +40,22 @@ bb slopcop show                       # the review it would have posted
 bb slopcop rules edit security-sweep --live
 ```
 
+Listen for new bug reports with the same rule system:
+
+```sh
+bb slopcop rules add \
+  --name issue-triage \
+  --repo owner/repo \
+  --project my-project \
+  --trigger new_issue \
+  --label bug \
+  --prompt "Triage the report. Ask for missing reproduction details and post the response."
+```
+
+The first issue poll records the open backlog. It does not dispatch agents for it.
+Later issues dispatch once. A full review queue delays the event until a later poll.
+The default trust gate handles only issues from repository members and collaborators.
+
 To put all new review threads in one BB section, set its name or ID:
 
 ```sh
@@ -55,7 +70,7 @@ Three decisions do most of the work.
 
 ### The trust gate stops it running strangers' code
 
-Reviewing a PR means the agent runs `gh pr checkout` on that branch and reads the diff
+Reviewing a PR means the agent can run `gh pr checkout` on that branch and read the diff
 into its own prompt. For an untrusted PR that is arbitrary code execution plus a prompt
 injection surface, so rules default to **write access only**.
 
@@ -64,6 +79,7 @@ means "has had a commit merged before", not write access.** A literal "contribut
 only" filter still runs on a drive-by who landed one typo fix a year ago. Only
 `OWNER` / `MEMBER` / `COLLABORATOR` imply write access, so only those are trusted by
 default. `--trust past_contributors` and `--trust anyone` exist and are named honestly.
+The same gate protects issue rules because issue text is also an untrusted prompt source.
 
 Note that BB's permission modes are `full`, `auto`, and `accept-edits` — **none is
 read-only**. There is no "run the agent sandboxed" option, so the trust gate is the
@@ -83,16 +99,17 @@ Three findings, one blocking…
 ```
 
 When the review thread finishes, SlopCop **does not trust the agent's transcript**. It
-polls GitHub's three separate comment surfaces (issue comments, inline review comments,
-review bodies) and matches on the marker. A run that claims success but posted nothing
+polls the applicable GitHub comment surfaces and matches on the marker. Pull request
+runs use issue comments, inline comments, and review bodies. Issue runs use issue
+comments. A run that claims success but posted nothing
 is reported as `no_comment`, not as a success. If the header is present but the marker
 is missing, the comment is still attributed — and flagged as prompt drift.
 
 ### Shadow mode makes a prompt change safe to test
 
 A rule's prompt is the whole product, and prompts drift. Shadow mode runs the real
-review against a real PR and stores the exact body it would have posted, so a prompt
-change can be dry-run before it is ever visible to your team.
+review or issue response against a real target. It stores the exact body without a
+GitHub write, so a prompt change can be tested before it is visible to your team.
 
 ## Running under a bot identity
 
@@ -111,8 +128,8 @@ an app owned by a person dies with that person's access:
 
 1. Open `https://github.com/organizations/<org>/settings/apps/new`.
 2. Clear the **Webhook → Active** checkbox. SlopCop polls, so it needs no webhook.
-3. Grant repository permissions: Pull requests **Read and write**, Contents
-   **Read-only**, Metadata **Read-only**.
+3. Grant repository permissions: Pull requests **Read and write**, Issues
+   **Read and write**, Contents **Read-only**, Metadata **Read-only**.
 4. Create the app. Record the App ID. Generate a private key and save the `.pem` file.
 5. Install the app on every repo a rule watches. The poller reads through the same
    identity, so a missing installation fails the poll for that repo.
@@ -167,8 +184,8 @@ Two consequences worth knowing:
 | `bb slopcop rules` | List rules |
 | `bb slopcop rules add\|edit <rule>` | Create or update (see flags below) |
 | `bb slopcop rules enable\|disable\|rm <rule>` | Toggle or delete |
-| `bb slopcop check <rule> <pr>` | Dry run — match, or the exact reason it did not |
-| `bb slopcop dispatch <rule> <pr> [--force]` | Run now |
+| `bb slopcop check <rule> <number> [--issue]` | Dry run — match, or the exact reason it did not |
+| `bb slopcop dispatch <rule> <number> [--issue] [--force]` | Run now |
 | `bb slopcop runs [--rule <r>] [--limit N]` | Recent runs |
 | `bb slopcop show [run-id]` | A run and the review body it produced |
 | `bb slopcop verify [run-id]` | Re-check a live run's comments against GitHub |
@@ -182,15 +199,16 @@ Rule flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy --trigger
 --live --shadow --disabled --hidden --visible`. Add `--json` to any command.
 
-`check` answers "why didn't SlopCop review my PR?" with the single decisive reason.
+An issue-only rule selects issues automatically for manual commands. Use `--issue` for
+a rule that listens to both target types.
 
 ## Rules
 
 | Field | Meaning |
 |---|---|
 | `repo` | One `owner/repo` per rule |
-| `triggers` | `ready_for_review`, `new_commits` |
-| `conditions` | Changed paths, base branch, labels, author, title regex, diff size — ANDed |
+| `triggers` | `ready_for_review`, `new_commits`, `new_issue` |
+| `conditions` | Labels, author, and title apply to both target types. Paths, base, and diff size apply only to PRs. |
 | `authorTrust` | `write_access` (default), `past_contributors`, `anyone` |
 | `mode` | `shadow` (default) or `live` |
 | `dedupe` | `once_per_pr` (default) or `once_per_head_sha` |

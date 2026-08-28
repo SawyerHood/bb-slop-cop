@@ -7,7 +7,7 @@ import {
   TRUSTED_ASSOCIATIONS,
   type AuthorAssociation,
   type Condition,
-  type PullRequest,
+  type GitHubTarget,
   type Rule,
   type Trigger,
 } from "./types";
@@ -36,6 +36,14 @@ export function computeTriggers(input: {
   }
   if (seen.wasDraft) return ["ready_for_review"];
   return seen.headSha !== input.headSha ? ["new_commits"] : [];
+}
+
+/** A new issue fires once after the issue watcher has recorded its backlog. */
+export function computeIssueTriggers(input: {
+  seen: boolean;
+  repoBootstrapped: boolean;
+}): Trigger[] {
+  return !input.seen && input.repoBootstrapped ? ["new_issue"] : [];
 }
 
 export type MatchResult =
@@ -109,34 +117,38 @@ function describeCondition(condition: Condition): string {
 
 function evaluateCondition(
   condition: Condition,
-  pullRequest: PullRequest,
+  target: GitHubTarget,
 ): boolean {
   switch (condition.kind) {
     case "paths":
-      return pullRequest.files.some((file) =>
+      // PR-only conditions do not restrict issue events on a mixed rule.
+      if (target.kind === "issue") return true;
+      return target.files.some((file) =>
         matchesAnyGlob(condition.globs, file.path),
       );
     case "base_branch":
-      return matchesAnyGlob(condition.globs, pullRequest.baseRefName);
+      return target.kind === "issue"
+        ? true
+        : matchesAnyGlob(condition.globs, target.baseRefName);
     case "has_label":
-      return pullRequest.labels.some((label) =>
+      return target.labels.some((label) =>
         condition.labels.includes(label.name),
       );
     case "missing_label":
-      return !pullRequest.labels.some((label) =>
+      return !target.labels.some((label) =>
         condition.labels.includes(label.name),
       );
     case "author":
-      return condition.logins.includes(pullRequest.author?.login ?? "");
+      return condition.logins.includes(target.author?.login ?? "");
     case "title_matches":
       try {
-        return new RegExp(condition.regex).test(pullRequest.title);
+        return new RegExp(condition.regex).test(target.title);
       } catch {
         // A malformed regex must not match everything by accident.
         return false;
       }
     case "max_changed_files":
-      return pullRequest.files.length <= condition.value;
+      return target.kind === "issue" || target.files.length <= condition.value;
   }
 }
 
@@ -147,7 +159,7 @@ function evaluateCondition(
  */
 export function evaluateRule(
   rule: Rule,
-  pullRequest: PullRequest,
+  target: GitHubTarget,
   trigger: Trigger,
 ): MatchResult {
   if (!rule.enabled) {
@@ -156,19 +168,19 @@ export function evaluateRule(
   if (trigger !== "manual" && !rule.triggers.includes(trigger)) {
     return { matched: false, reason: `rule does not listen for ${trigger}` };
   }
-  if (pullRequest.isDraft) {
+  if (target.kind === "pull_request" && target.isDraft) {
     return { matched: false, reason: "pull request is a draft" };
   }
-  if (!isTrustedAuthor(pullRequest.authorAssociation, rule.authorTrust)) {
-    const login = pullRequest.author?.login ?? "unknown";
+  if (!isTrustedAuthor(target.authorAssociation, rule.authorTrust)) {
+    const login = target.author?.login ?? "unknown";
     return {
       matched: false,
       blockedByTrust: true,
-      reason: `author @${login} is ${pullRequest.authorAssociation}, and this rule only reviews ${describeTrust(rule.authorTrust)}`,
+      reason: `author @${login} is ${target.authorAssociation}, and this rule only handles ${describeTrust(rule.authorTrust)}`,
     };
   }
   for (const condition of rule.conditions) {
-    if (!evaluateCondition(condition, pullRequest)) {
+    if (!evaluateCondition(condition, target)) {
       return { matched: false, reason: describeCondition(condition) };
     }
   }
@@ -194,13 +206,16 @@ export function describeTrust(trust: Rule["authorTrust"]): string {
  * already-open door.
  */
 export function isDangerousCombination(rule: Rule): boolean {
-  return rule.authorTrust === "anyone";
+  const listensForPullRequests = rule.triggers.some(
+    (trigger) => trigger === "ready_for_review" || trigger === "new_commits",
+  );
+  return rule.authorTrust === "anyone" && listensForPullRequests;
 }
 
 /** True when the rule is in the worst corner: any author AND full access. */
 export function isSevereCombination(rule: Rule): boolean {
   return (
-    rule.authorTrust === "anyone" && rule.request?.permissionMode === "full"
+    isDangerousCombination(rule) && rule.request?.permissionMode === "full"
   );
 }
 

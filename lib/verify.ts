@@ -6,7 +6,12 @@
 // instead. Both paths converge on the same status vocabulary.
 import { attributeBody, hasVisibleHeader, parseMarker } from "./marker";
 import type { GhClient, GhComment } from "./gh";
-import type { CommentKind, RunComment, RunStatus } from "./types";
+import type {
+  CommentKind,
+  RunComment,
+  RunStatus,
+  TargetKind,
+} from "./types";
 
 export interface VerifyResult {
   status: RunStatus;
@@ -54,17 +59,29 @@ export async function verifyLive(options: {
   gh: GhClient;
   repo: string;
   prNumber: number;
+  targetKind?: TargetKind;
   runId: string;
   startedAt: number;
   authenticatedLogin: string | null;
 }): Promise<VerifyResult> {
-  const { gh, repo, prNumber, runId, startedAt, authenticatedLogin } = options;
+  const {
+    gh,
+    repo,
+    prNumber,
+    runId,
+    startedAt,
+    authenticatedLogin,
+    targetKind = "pull_request",
+  } = options;
 
-  const [issueComments, reviewComments, reviews] = await Promise.all([
-    gh.listIssueComments(repo, prNumber),
-    gh.listReviewComments(repo, prNumber),
-    gh.listReviews(repo, prNumber),
-  ]);
+  const [issueComments, reviewComments, reviews] =
+    targetKind === "issue"
+      ? [await gh.listIssueComments(repo, prNumber), [], []]
+      : await Promise.all([
+          gh.listIssueComments(repo, prNumber),
+          gh.listReviewComments(repo, prNumber),
+          gh.listReviews(repo, prNumber),
+        ]);
 
   const sources: { comments: GhComment[]; kind: CommentKind }[] = [
     { comments: issueComments, kind: "summary" },
@@ -135,7 +152,9 @@ export async function verifyLive(options: {
   }
   return {
     status: "no_comment",
-    detail: "the review thread finished without posting anything to the PR",
+    detail: `the thread finished without posting anything to the ${
+      targetKind === "issue" ? "issue" : "PR"
+    }`,
     comments: [],
   };
 }
