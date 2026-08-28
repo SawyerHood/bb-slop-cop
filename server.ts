@@ -1,10 +1,10 @@
-// SlopCop — configurable PR review rules that dispatch BB agents.
+// SlopCop — configurable GitHub issue and PR rules that dispatch BB agents.
 //
 // Flow: a watcher polls each watched repo with `gh`, detects the
 // draft -> ready-for-review edge, matches PRs against enabled rules, and spawns
 // a review thread per match. When that thread goes idle, SlopCop verifies the
 // outcome against GitHub itself rather than trusting the agent's transcript.
-import { defineRpcContract, type BbPluginApi } from "@bb/plugin-sdk";
+import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
 import { createStore, MIGRATIONS, type Store } from "./lib/db";
@@ -12,6 +12,7 @@ import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
 import {
+  computeIssueTriggers,
   computeTriggers,
   describeTrust,
   evaluateRule,
@@ -25,8 +26,11 @@ import {
   reviewStrategySchema,
   ruleModeSchema,
   threadRequestSchema,
+  targetKindSchema,
   triggerSchema,
   visibilitySchema,
+  type GitHubIssue,
+  type GitHubTarget,
   type PullRequest,
   type Rule,
   type Trigger,
@@ -73,6 +77,7 @@ const runOutputSchema = z.object({
   ruleId: z.string(),
   ruleName: z.string(),
   repo: z.string(),
+  targetKind: targetKindSchema,
   prNumber: z.number(),
   prTitle: z.string(),
   prAuthor: z.string(),
@@ -138,6 +143,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({
       ruleId: z.string(),
       prNumber: z.number().int(),
+      targetKind: targetKindSchema.default("pull_request"),
       force: z.boolean().optional(),
     }),
     output: z.object({
@@ -260,7 +266,7 @@ export default async function plugin(bb: BbPluginApi) {
    */
   async function dispatch(
     rule: Rule,
-    pullRequest: PullRequest,
+    target: GitHubTarget,
     options: { forcedReason?: string | null } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
     const runId = newId("run");
@@ -274,10 +280,11 @@ export default async function plugin(bb: BbPluginApi) {
       ruleId: rule.id,
       ruleName: rule.name,
       repo: rule.repo,
-      prNumber: pullRequest.number,
-      prTitle: pullRequest.title,
-      prAuthor: pullRequest.author?.login ?? "",
-      headSha: pullRequest.headRefOid,
+      targetKind: target.kind,
+      prNumber: target.number,
+      prTitle: target.title,
+      prAuthor: target.author?.login ?? "",
+      headSha: target.kind === "pull_request" ? target.headRefOid : "",
       status: "dispatched",
       mode: rule.mode,
       detail:
@@ -301,7 +308,7 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const { botGhPath, defaultThreadSection } = await readSettings();
-    const context = { rule, pullRequest, runId, ghCommand: botGhPath };
+    const context = { rule, target, runId, ghCommand: botGhPath };
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
       // `input`, so it must be dropped here — the prompt SlopCop builds from
@@ -347,7 +354,7 @@ export default async function plugin(bb: BbPluginApi) {
       inFlight += 1;
       announce();
       bb.log.info(
-        `dispatched ${rule.name} for ${rule.repo}#${pullRequest.number} (${rule.mode}) -> ${threadId}`,
+        `dispatched ${rule.name} for ${target.kind} ${rule.repo}#${target.number} (${rule.mode}) -> ${threadId}`,
       );
       return { runId, threadId };
     } catch (error) {
@@ -364,7 +371,7 @@ export default async function plugin(bb: BbPluginApi) {
   /** Records a rule that matched nothing, so "why no review?" is answerable. */
   function recordSkip(
     rule: Rule,
-    pullRequest: PullRequest,
+    target: GitHubTarget,
     reason: string,
   ): void {
     store.insertRun({
@@ -372,10 +379,11 @@ export default async function plugin(bb: BbPluginApi) {
       ruleId: rule.id,
       ruleName: rule.name,
       repo: rule.repo,
-      prNumber: pullRequest.number,
-      prTitle: pullRequest.title,
-      prAuthor: pullRequest.author?.login ?? "",
-      headSha: pullRequest.headRefOid,
+      targetKind: target.kind,
+      prNumber: target.number,
+      prTitle: target.title,
+      prAuthor: target.author?.login ?? "",
+      headSha: target.kind === "pull_request" ? target.headRefOid : "",
       status: "skipped",
       mode: rule.mode,
       detail: reason,
@@ -387,84 +395,154 @@ export default async function plugin(bb: BbPluginApi) {
   }
 
   /**
-   * One polling pass. Detects the ready-for-review edge per PR, then evaluates
-   * every rule watching that repo.
+   * One polling pass. It detects PR edges and new issues. It then evaluates
+   * the applicable rules for each target.
    */
   async function poll(maxConcurrent: number): Promise<void> {
     const rules = store.listRules().filter((rule) => rule.enabled);
     const repos = [...new Set(rules.map((rule) => rule.repo))];
 
     for (const repo of repos) {
-      let pullRequests: PullRequest[];
-      try {
-        pullRequests = await gh.listOpenPullRequests(repo);
-      } catch (error) {
-        bb.log.warn(
-          `poll failed for ${repo}: ${error instanceof Error ? error.message : String(error)}`,
-        );
-        continue;
-      }
+      const repoRules = rules.filter((candidate) => candidate.repo === repo);
+      const pullRequestRules = repoRules.filter((rule) =>
+        rule.triggers.some(
+          (trigger) =>
+            trigger === "ready_for_review" || trigger === "new_commits",
+        ),
+      );
+      const issueRules = repoRules.filter((rule) =>
+        rule.triggers.includes("new_issue"),
+      );
 
-      // First pass over a repo only records what is already open, so enabling a
-      // rule never reviews the backlog. Every later unseen PR is genuinely new.
-      const repoBootstrapped = store.isBootstrapped(repo);
-      if (!repoBootstrapped) {
-        bb.log.info(
-          `bootstrapping ${repo}: recording ${pullRequests.length} open PR(s) as backlog`,
-        );
-      }
-
-      for (const pullRequest of pullRequests) {
-        const triggers: Trigger[] = computeTriggers({
-          seen: store.getSeen(repo, pullRequest.number),
-          isDraft: pullRequest.isDraft,
-          headSha: pullRequest.headRefOid,
-          repoBootstrapped,
-        });
-        store.markSeen(
-          repo,
-          pullRequest.number,
-          pullRequest.headRefOid,
-          pullRequest.isDraft,
-          Date.now(),
-        );
-        if (triggers.length === 0) continue;
-
-        const repoRules = rules.filter((candidate) => candidate.repo === repo);
-        await hydrateFiles(repoRules, repo, pullRequest);
-
-        for (const rule of repoRules) {
-          for (const trigger of triggers) {
-            const result = evaluateRule(rule, pullRequest, trigger);
-            if (!result.matched) {
-              if (result.blockedByTrust) {
-                recordSkip(rule, pullRequest, result.reason);
-                announce();
-              }
-              continue;
-            }
-            const alreadyRan = store.hasRunFor(
-              rule.id,
-              repo,
-              pullRequest.number,
-              rule.dedupe === "once_per_head_sha"
-                ? pullRequest.headRefOid
-                : null,
+      if (pullRequestRules.length > 0) {
+        try {
+          const pullRequests = await gh.listOpenPullRequests(repo);
+          const repoBootstrapped = store.isBootstrapped(repo);
+          if (!repoBootstrapped) {
+            bb.log.info(
+              `bootstrapping ${repo}: recording ${pullRequests.length} open PR(s) as backlog`,
             );
-            if (alreadyRan) continue;
-            if (inFlight >= maxConcurrent) {
-              bb.log.info(
-                `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
-              );
-              continue;
-            }
-            await dispatch(rule, pullRequest);
-            break;
           }
+
+          for (const pullRequest of pullRequests) {
+            const triggers: Trigger[] = computeTriggers({
+              seen: store.getSeen(repo, pullRequest.number),
+              isDraft: pullRequest.isDraft,
+              headSha: pullRequest.headRefOid,
+              repoBootstrapped,
+            });
+            let retry = false;
+            if (triggers.length > 0) {
+              await hydrateFiles(pullRequestRules, repo, pullRequest);
+              for (const rule of pullRequestRules) {
+                for (const trigger of triggers) {
+                  const result = evaluateRule(rule, pullRequest, trigger);
+                  if (!result.matched) {
+                    if (result.blockedByTrust) {
+                      recordSkip(rule, pullRequest, result.reason);
+                      announce();
+                    }
+                    continue;
+                  }
+                  const alreadyRan = store.hasRunFor(
+                    rule.id,
+                    repo,
+                    "pull_request",
+                    pullRequest.number,
+                    rule.dedupe === "once_per_head_sha"
+                      ? pullRequest.headRefOid
+                      : null,
+                  );
+                  if (alreadyRan) continue;
+                  if (inFlight >= maxConcurrent) {
+                    retry = true;
+                    bb.log.info(
+                      `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+                    );
+                    continue;
+                  }
+                  await dispatch(rule, pullRequest);
+                  break;
+                }
+              }
+            }
+            if (!retry) {
+              store.markSeen(
+                repo,
+                pullRequest.number,
+                pullRequest.headRefOid,
+                pullRequest.isDraft,
+                Date.now(),
+              );
+            }
+          }
+          store.markBootstrapped(repo, Date.now());
+        } catch (error) {
+          bb.log.warn(
+            `PR poll failed for ${repo}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
         }
       }
 
-      store.markBootstrapped(repo, Date.now());
+      if (issueRules.length > 0) {
+        try {
+          const issues = await gh.listOpenIssues(repo);
+          const repoBootstrapped = store.isIssueBootstrapped(repo);
+          if (!repoBootstrapped) {
+            bb.log.info(
+              `bootstrapping ${repo}: recording ${issues.length} open issue(s) as backlog`,
+            );
+          }
+
+          for (const issue of issues) {
+            const triggers = computeIssueTriggers({
+              seen: store.hasSeenIssue(repo, issue.number),
+              repoBootstrapped,
+            });
+            let retry = false;
+            if (triggers.length === 0) {
+              store.markIssueSeen(repo, issue.number, Date.now());
+              continue;
+            }
+            for (const rule of issueRules) {
+              const result = evaluateRule(rule, issue, triggers[0]!);
+              if (!result.matched) {
+                if (result.blockedByTrust) {
+                  recordSkip(rule, issue, result.reason);
+                  announce();
+                }
+                continue;
+              }
+              const alreadyRan = store.hasRunFor(
+                rule.id,
+                repo,
+                "issue",
+                issue.number,
+                null,
+              );
+              if (alreadyRan) continue;
+              if (inFlight >= maxConcurrent) {
+                retry = true;
+                bb.log.info(
+                  `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+                );
+                continue;
+              }
+              await dispatch(rule, issue);
+            }
+            if (!retry) store.markIssueSeen(repo, issue.number, Date.now());
+          }
+          store.markIssueBootstrapped(repo, Date.now());
+        } catch (error) {
+          bb.log.warn(
+            `issue poll failed for ${repo}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      }
     }
   }
 
@@ -494,6 +572,7 @@ export default async function plugin(bb: BbPluginApi) {
         gh,
         repo: run.repo,
         prNumber: run.prNumber,
+        targetKind: run.targetKind,
         runId: run.id,
         startedAt: run.startedAt,
         authenticatedLogin: ghLogin,
@@ -520,7 +599,7 @@ export default async function plugin(bb: BbPluginApi) {
     });
     announce();
     bb.log.info(
-      `run ${run.id} (${run.ruleName} #${run.prNumber}) -> ${result.status}`,
+      `run ${run.id} (${run.ruleName} ${run.targetKind} #${run.prNumber}) -> ${result.status}`,
     );
   }
 
@@ -593,6 +672,22 @@ export default async function plugin(bb: BbPluginApi) {
     return { pullRequest, result };
   }
 
+  async function checkTarget(
+    rule: Rule,
+    targetKind: "pull_request" | "issue",
+    number: number,
+  ) {
+    if (targetKind === "pull_request") {
+      const { pullRequest, result } = await checkPr(rule, number);
+      return { target: pullRequest as GitHubTarget, result };
+    }
+    const issue = await gh.getIssue(rule.repo, number);
+    return {
+      target: issue as GitHubTarget,
+      result: evaluateRule(rule, issue, "manual"),
+    };
+  }
+
   function saveRule(
     id: string | null,
     input: z.infer<typeof ruleInputSchema>,
@@ -608,7 +703,7 @@ export default async function plugin(bb: BbPluginApi) {
     store.upsertRule(rule);
     if (isDangerousCombination(rule)) {
       bb.log.warn(
-        `rule '${rule.name}' reviews PRs from ANY author with a non-restricted permission mode — untrusted code will run with full access`,
+        `rule '${rule.name}' reviews PRs from ANY author — untrusted code can run with agent access`,
       );
     }
     return rule;
@@ -657,15 +752,15 @@ export default async function plugin(bb: BbPluginApi) {
       };
     },
 
-    dispatchNow: async ({ ruleId, prNumber, force }) => {
+    dispatchNow: async ({ ruleId, prNumber, targetKind, force }) => {
       const rule = resolveRule(ruleId);
-      const { pullRequest, result } = await checkPr(rule, prNumber);
+      const { target, result } = await checkTarget(rule, targetKind, prNumber);
       if (!result.matched && force !== true) {
         // Refuse rather than silently reviewing: the caller gets the reason and
         // can re-issue with force once a human has judged it.
         return { runId: null, threadId: null, blockedReason: result.reason };
       }
-      const dispatched = await dispatch(rule, pullRequest, {
+      const dispatched = await dispatch(rule, target, {
         forcedReason: result.matched ? null : result.reason,
       });
       return { ...dispatched, blockedReason: null };
@@ -694,7 +789,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   bb.cli.register({
     name: "slopcop",
-    summary: "Configure automated PR review rules",
+    summary: "Configure automated GitHub review and issue rules",
     commands: [
       {
         name: "rules",
@@ -724,13 +819,13 @@ export default async function plugin(bb: BbPluginApi) {
       },
       {
         name: "check",
-        summary: "Dry-run a rule against a PR and explain the outcome",
-        usage: "bb slopcop check <id|name> <pr-number>",
+        summary: "Dry-run a rule against a PR or issue",
+        usage: "bb slopcop check <id|name> <number> [--issue]",
       },
       {
         name: "dispatch",
-        summary: "Run a rule against a PR now",
-        usage: "bb slopcop dispatch <id|name> <pr-number> [--force]",
+        summary: "Run a rule against a PR or issue now",
+        usage: "bb slopcop dispatch <id|name> <number> [--issue] [--force]",
       },
       {
         name: "verify",
@@ -916,7 +1011,7 @@ export default async function plugin(bb: BbPluginApi) {
           const rule = saveRule(existing?.id ?? null, parsed);
           announce();
           const warning = isDangerousCombination(rule)
-            ? "\nWARNING: this rule reviews PRs from ANY author without a restricted permission mode."
+            ? "\nWARNING: this rule reviews PRs from ANY author, so untrusted code can run."
             : "";
           const unconfigured =
             rule.request === null
@@ -964,7 +1059,9 @@ export default async function plugin(bb: BbPluginApi) {
             runs
               .map(
                 (run) =>
-                  `${run.status.padEnd(24)} ${run.ruleName}  #${run.prNumber} ${run.prTitle}` +
+                  `${run.status.padEnd(24)} ${run.ruleName}  ${
+                    run.targetKind === "issue" ? "issue" : "PR"
+                  } #${run.prNumber} ${run.prTitle}` +
                   (run.commentCount > 0
                     ? `  (${run.commentCount} comment(s))`
                     : "") +
@@ -989,6 +1086,7 @@ export default async function plugin(bb: BbPluginApi) {
             gh,
             repo: run.repo,
             prNumber: run.prNumber,
+            targetKind: run.targetKind,
             runId: run.id,
             startedAt: run.startedAt,
             authenticatedLogin: ghLogin,
@@ -1016,7 +1114,7 @@ export default async function plugin(bb: BbPluginApi) {
           const comments = store.listComments(run.id);
           if (json) return ok(JSON.stringify({ run, comments }, null, 2));
           const header =
-            `${run.ruleName} — ${run.repo}#${run.prNumber} ${run.prTitle}\n` +
+            `${run.ruleName} — ${run.targetKind === "issue" ? "issue" : "PR"} ${run.repo}#${run.prNumber} ${run.prTitle}\n` +
             `status: ${run.status}${run.mode === "shadow" ? " (shadow — nothing was posted)" : ""}` +
             (run.detail === null ? "" : `\ndetail: ${run.detail}`);
           const bodies = comments
@@ -1032,43 +1130,63 @@ export default async function plugin(bb: BbPluginApi) {
 
         if (command === "check" || command === "dispatch") {
           const rule = resolveRule(argv[1] ?? "");
-          const prNumber = Number.parseInt(argv[2] ?? "", 10);
-          if (!Number.isFinite(prNumber)) return fail("expected a PR number");
+          const number = Number.parseInt(argv[2] ?? "", 10);
+          if (!Number.isFinite(number)) {
+            return fail("expected an issue or PR number");
+          }
+          const listensOnlyForIssues =
+            rule.triggers.includes("new_issue") &&
+            !rule.triggers.some(
+              (trigger) =>
+                trigger === "ready_for_review" || trigger === "new_commits",
+            );
+          const targetKind =
+            has("issue") || listensOnlyForIssues ? "issue" : "pull_request";
+          const targetLabel = targetKind === "issue" ? "issue" : "PR";
 
           if (command === "check") {
-            const { pullRequest, result } = await checkPr(rule, prNumber);
+            const { target, result } = await checkTarget(
+              rule,
+              targetKind,
+              number,
+            );
             const payload = {
               matched: result.matched,
               reason: result.matched ? null : result.reason,
-              pr: {
-                number: pullRequest.number,
-                title: pullRequest.title,
-                author: pullRequest.author?.login ?? "",
-                association: pullRequest.authorAssociation,
+              target: {
+                kind: target.kind,
+                number: target.number,
+                title: target.title,
+                author: target.author?.login ?? "",
+                association: target.authorAssociation,
               },
             };
             return ok(
               json
                 ? JSON.stringify(payload, null, 2)
                 : result.matched
-                  ? `MATCH — '${rule.name}' would review #${prNumber} (${pullRequest.title}) in ${rule.mode} mode.`
+                  ? `MATCH — '${rule.name}' would handle ${targetLabel} #${number} (${target.title}) in ${rule.mode} mode.`
                   : `NO MATCH — ${result.reason}`,
             );
           }
 
-          const { pullRequest, result } = await checkPr(rule, prNumber);
+          const { target, result } = await checkTarget(
+            rule,
+            targetKind,
+            number,
+          );
           if (!result.matched && !has("force")) {
             return fail(
-              `'${rule.name}' does not match PR #${prNumber}: ${result.reason}\nRe-run with --force to dispatch anyway.`,
+              `'${rule.name}' does not match ${targetLabel} #${number}: ${result.reason}\nRe-run with --force to dispatch anyway.`,
             );
           }
-          const dispatched = await dispatch(rule, pullRequest, {
+          const dispatched = await dispatch(rule, target, {
             forcedReason: result.matched ? null : result.reason,
           });
           return ok(
             json
               ? JSON.stringify(dispatched, null, 2)
-              : `Dispatched ${rule.name} for #${prNumber} (${rule.mode} mode). run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
+              : `Dispatched ${rule.name} for ${targetLabel} #${number} (${rule.mode} mode). run=${dispatched.runId} thread=${dispatched.threadId ?? "none"}`,
           );
         }
 

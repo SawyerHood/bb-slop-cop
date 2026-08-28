@@ -4,7 +4,7 @@
 // and comment state itself rather than trusting a transcript. Mirrors the
 // official github plugin's execFile approach.
 import { execFile } from "node:child_process";
-import type { PullRequest } from "./types";
+import type { GitHubIssue, PullRequest } from "./types";
 
 export class GhError extends Error {
   constructor(
@@ -23,6 +23,8 @@ export class GhError extends Error {
 export interface GhClient {
   listOpenPullRequests(repo: string): Promise<PullRequest[]>;
   getPullRequest(repo: string, number: number): Promise<PullRequest>;
+  listOpenIssues(repo: string): Promise<GitHubIssue[]>;
+  getIssue(repo: string, number: number): Promise<GitHubIssue>;
   listFiles(repo: string, number: number): Promise<{ path: string }[]>;
   listIssueComments(repo: string, number: number): Promise<GhComment[]>;
   listReviewComments(repo: string, number: number): Promise<GhComment[]>;
@@ -108,6 +110,7 @@ export function toPullRequest(raw: unknown): PullRequest {
   const baseRepo = asRecord(base.repo);
   const labels = Array.isArray(row.labels) ? row.labels : [];
   return {
+    kind: "pull_request",
     number: typeof row.number === "number" ? row.number : 0,
     title: typeof row.title === "string" ? row.title : "",
     isDraft: row.draft === true,
@@ -131,15 +134,39 @@ export function toPullRequest(raw: unknown): PullRequest {
   };
 }
 
+/** Maps a REST issue object and excludes pull requests from issue listings. */
+export function toIssue(raw: unknown): GitHubIssue | null {
+  const row = asRecord(raw);
+  if (row.pull_request !== undefined) return null;
+  const labels = Array.isArray(row.labels) ? row.labels : [];
+  return {
+    kind: "issue",
+    number: typeof row.number === "number" ? row.number : 0,
+    title: typeof row.title === "string" ? row.title : "",
+    body: typeof row.body === "string" ? row.body : "",
+    author: { login: String(asRecord(row.user).login ?? "") },
+    authorAssociation:
+      typeof row.author_association === "string"
+        ? (row.author_association as GitHubIssue["authorAssociation"])
+        : "NONE",
+    labels: labels.map((label) => ({
+      name: String(asRecord(label).name ?? ""),
+    })),
+    createdAt: typeof row.created_at === "string" ? row.created_at : "",
+    updatedAt: typeof row.updated_at === "string" ? row.updated_at : "",
+  };
+}
+
 export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const apiRows = async (endpoint: string): Promise<unknown[]> => {
     const stdout = await run(
       ghPath,
-      ["api", "--paginate", endpoint],
+      ["api", "--paginate", "--slurp", endpoint],
       timeoutMs,
     );
     const parsed: unknown = JSON.parse(stdout);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed.flatMap((page) => (Array.isArray(page) ? page : [page]));
   };
   const api = async (endpoint: string): Promise<GhComment[]> =>
     (await apiRows(endpoint)).map(toComment);
@@ -159,6 +186,28 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
         timeoutMs,
       );
       return toPullRequest(JSON.parse(stdout));
+    },
+
+    async listOpenIssues(repo) {
+      const rows = await apiRows(
+        `repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=100`,
+      );
+      return rows
+        .map(toIssue)
+        .filter((issue): issue is GitHubIssue => issue !== null);
+    },
+
+    async getIssue(repo, number) {
+      const stdout = await run(
+        ghPath,
+        ["api", `repos/${repo}/issues/${number}`],
+        timeoutMs,
+      );
+      const issue = toIssue(JSON.parse(stdout));
+      if (issue === null) {
+        throw new Error(`${repo}#${number} is a pull request, not an issue`);
+      }
+      return issue;
     },
 
     async listFiles(repo, number) {
