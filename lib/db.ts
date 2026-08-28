@@ -13,6 +13,7 @@ import type {
 // The plugin SDK's database handle is better-sqlite3; typed structurally so
 // this module stays unit-testable without importing the driver.
 export interface Database {
+  exec(sql: string): unknown;
   prepare(sql: string): {
     run(...params: unknown[]): unknown;
     get(...params: unknown[]): unknown;
@@ -102,6 +103,33 @@ export const MIGRATIONS: string[] = [
      bootstrapped_at INTEGER NOT NULL
    )`,
 ];
+
+export function repairIssueSchema(db: Database): void {
+  const hasTargetKind = db
+    .prepare(`PRAGMA table_info(runs)`)
+    .all()
+    .some(
+      (row) =>
+        typeof row === "object" &&
+        row !== null &&
+        Reflect.get(row, "name") === "target_kind",
+    );
+  if (!hasTargetKind) {
+    db.exec(
+      `ALTER TABLE runs ADD COLUMN target_kind TEXT NOT NULL DEFAULT 'pull_request'`,
+    );
+  }
+  db.exec(`CREATE TABLE IF NOT EXISTS seen_issues (
+     repo TEXT NOT NULL,
+     issue_number INTEGER NOT NULL,
+     updated_at INTEGER NOT NULL,
+     PRIMARY KEY (repo, issue_number)
+   )`);
+  db.exec(`CREATE TABLE IF NOT EXISTS watched_issue_repos (
+     repo TEXT PRIMARY KEY,
+     bootstrapped_at INTEGER NOT NULL
+   )`);
+}
 
 type Row = Record<string, unknown>;
 

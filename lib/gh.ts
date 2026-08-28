@@ -23,7 +23,7 @@ export class GhError extends Error {
 export interface GhClient {
   listOpenPullRequests(repo: string): Promise<PullRequest[]>;
   getPullRequest(repo: string, number: number): Promise<PullRequest>;
-  listOpenIssues(repo: string): Promise<GitHubIssue[]>;
+  listOpenIssueNumbers(repo: string): Promise<number[]>;
   getIssue(repo: string, number: number): Promise<GitHubIssue>;
   listFiles(repo: string, number: number): Promise<{ path: string }[]>;
   listIssueComments(repo: string, number: number): Promise<GhComment[]>;
@@ -157,6 +157,18 @@ export function toIssue(raw: unknown): GitHubIssue | null {
   };
 }
 
+export function toIssueNumbers(raw: unknown): number[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.flatMap((value) => {
+    const number = asRecord(value).number;
+    return typeof number === "number" &&
+      Number.isSafeInteger(number) &&
+      number > 0
+      ? [number]
+      : [];
+  });
+}
+
 export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
   const apiRows = async (endpoint: string): Promise<unknown[]> => {
     const stdout = await run(
@@ -188,13 +200,24 @@ export function createGhClient(ghPath: string, timeoutMs = 30_000): GhClient {
       return toPullRequest(JSON.parse(stdout));
     },
 
-    async listOpenIssues(repo) {
-      const rows = await apiRows(
-        `repos/${repo}/issues?state=open&sort=created&direction=desc&per_page=100`,
+    async listOpenIssueNumbers(repo) {
+      const stdout = await run(
+        ghPath,
+        [
+          "issue",
+          "list",
+          "--repo",
+          repo,
+          "--state",
+          "open",
+          "--limit",
+          "1000",
+          "--json",
+          "number",
+        ],
+        timeoutMs,
       );
-      return rows
-        .map(toIssue)
-        .filter((issue): issue is GitHubIssue => issue !== null);
+      return toIssueNumbers(JSON.parse(stdout));
     },
 
     async getIssue(repo, number) {

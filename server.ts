@@ -7,7 +7,12 @@
 import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import { createGhClient, type GhClient } from "./lib/gh";
-import { createStore, MIGRATIONS, type Store } from "./lib/db";
+import {
+  createStore,
+  MIGRATIONS,
+  repairIssueSchema,
+  type Store,
+} from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
 import { resolveThreadSectionId } from "./lib/sections";
 import { expandHome } from "./lib/paths";
@@ -203,6 +208,7 @@ export default async function plugin(bb: BbPluginApi) {
 
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
+  repairIssueSchema(db);
   const store: Store = createStore(db as never);
 
   let gh: GhClient = createGhClient("gh");
@@ -488,24 +494,25 @@ export default async function plugin(bb: BbPluginApi) {
 
       if (issueRules.length > 0) {
         try {
-          const issues = await gh.listOpenIssues(repo);
+          const issueNumbers = await gh.listOpenIssueNumbers(repo);
           const repoBootstrapped = store.isIssueBootstrapped(repo);
           if (!repoBootstrapped) {
             bb.log.info(
-              `bootstrapping ${repo}: recording ${issues.length} open issue(s) as backlog`,
+              `bootstrapping ${repo}: recording ${issueNumbers.length} open issue(s) as backlog`,
             );
           }
 
-          for (const issue of issues) {
+          for (const issueNumber of issueNumbers) {
             const triggers = computeIssueTriggers({
-              seen: store.hasSeenIssue(repo, issue.number),
+              seen: store.hasSeenIssue(repo, issueNumber),
               repoBootstrapped,
             });
             let retry = false;
             if (triggers.length === 0) {
-              store.markIssueSeen(repo, issue.number, Date.now());
+              store.markIssueSeen(repo, issueNumber, Date.now());
               continue;
             }
+            const issue = await gh.getIssue(repo, issueNumber);
             for (const rule of issueRules) {
               const result = evaluateRule(rule, issue, triggers[0]!);
               if (!result.matched) {
