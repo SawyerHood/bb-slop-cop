@@ -41,7 +41,13 @@ bb slopcop rules add \
 
 Flags: `--name --repo --project --provider --model --reasoning --permission
 --prompt --paths --base --label --skip-label --trust --dedupe --strategy
---trigger --live --shadow --disabled --hidden --visible`.
+--trigger --keyword --requester-trust --live --shadow --disabled --hidden
+--visible`.
+
+To run only after a request, use `--trigger comment_matches` and a literal
+keyword such as `--keyword "@slopcop"`. Add `pr_description_matches` to check
+the initial ready PR description. Use `--dedupe once_per_trigger_event` so each
+new request can start one review. Comment requesters default to `write_access`.
 
 Use `--trigger new_issue` to listen for new issues. The first poll records the
 open backlog. Labels, authors, and titles can filter issues. PR-only conditions

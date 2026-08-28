@@ -11,6 +11,7 @@ import {
   createStore,
   MIGRATIONS,
   repairIssueSchema,
+  repairKeywordSchema,
   type Store,
 } from "./lib/db";
 import { buildPrompt, buildThreadTitle } from "./lib/dispatch";
@@ -21,7 +22,10 @@ import {
   computeTriggers,
   describeTrust,
   evaluateRule,
+  findMatchingKeyword,
   isDangerousCombination,
+  isTrustedAuthor,
+  matchesPrDescription,
 } from "./lib/matcher";
 import { verifyLive, verifyShadow } from "./lib/verify";
 import {
@@ -39,24 +43,41 @@ import {
   type PullRequest,
   type Rule,
   type Trigger,
+  type CommentTriggerEvent,
+  type TriggerCommentSource,
 } from "./lib/types";
 
 const RUNS_CHANNEL = "runs-changed";
 
-const ruleInputSchema = z.object({
-  name: z.string().min(1),
-  repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
-  enabled: z.boolean().default(true),
-  mode: ruleModeSchema.default("shadow"),
-  triggers: z.array(triggerSchema).min(1).default(["ready_for_review"]),
-  conditions: z.array(conditionSchema).default([]),
-  authorTrust: authorTrustSchema.default("write_access"),
-  prompt: z.string().default(""),
-  request: threadRequestSchema.nullable().default(null),
-  dedupe: dedupeSchema.default("once_per_pr"),
-  reviewStrategy: reviewStrategySchema.default("update"),
-  visibility: visibilitySchema.default("visible"),
-});
+const ruleInputSchema = z
+  .object({
+    name: z.string().min(1),
+    repo: z.string().regex(/^[\w.-]+\/[\w.-]+$/),
+    enabled: z.boolean().default(true),
+    mode: ruleModeSchema.default("shadow"),
+    triggers: z.array(triggerSchema).min(1).default(["ready_for_review"]),
+    commentKeywords: z.array(z.string().min(1)).default([]),
+    conditions: z.array(conditionSchema).default([]),
+    authorTrust: authorTrustSchema.default("write_access"),
+    requesterTrust: authorTrustSchema.default("write_access"),
+    prompt: z.string().default(""),
+    request: threadRequestSchema.nullable().default(null),
+    dedupe: dedupeSchema.default("once_per_pr"),
+    reviewStrategy: reviewStrategySchema.default("update"),
+    visibility: visibilitySchema.default("visible"),
+  })
+  .superRefine((rule, context) => {
+    const needsKeywords = rule.triggers.some((trigger) =>
+      ["comment_matches", "pr_description_matches"].includes(trigger),
+    );
+    if (needsKeywords && rule.commentKeywords.length === 0) {
+      context.addIssue({
+        code: "custom",
+        path: ["commentKeywords"],
+        message: "a comment or description trigger needs at least one keyword",
+      });
+    }
+  });
 
 const ruleOutputSchema = z.object({
   id: z.string(),
@@ -65,8 +86,11 @@ const ruleOutputSchema = z.object({
   enabled: z.boolean(),
   mode: z.string(),
   triggers: z.array(z.string()),
+  commentKeywords: z.array(z.string()),
   conditions: z.array(z.unknown()),
   authorTrust: z.string(),
+  requesterTrust: z.string(),
+  commentTriggerEnabledAt: z.number().nullable(),
   prompt: z.string(),
   request: z.unknown().nullable(),
   dedupe: z.string(),
@@ -87,6 +111,8 @@ const runOutputSchema = z.object({
   prTitle: z.string(),
   prAuthor: z.string(),
   headSha: z.string(),
+  trigger: z.string(),
+  triggerEventId: z.string().nullable(),
   status: z.string(),
   mode: z.string(),
   detail: z.string().nullable(),
@@ -209,6 +235,7 @@ export default async function plugin(bb: BbPluginApi) {
   const db = bb.storage.database();
   bb.storage.migrate(db, MIGRATIONS);
   repairIssueSchema(db);
+  repairKeywordSchema(db);
   const store: Store = createStore(db as never);
 
   let gh: GhClient = createGhClient("gh");
@@ -273,7 +300,16 @@ export default async function plugin(bb: BbPluginApi) {
   async function dispatch(
     rule: Rule,
     target: GitHubTarget,
-    options: { forcedReason?: string | null } = {},
+    options: {
+      forcedReason?: string | null;
+      trigger?: Trigger;
+      triggerEventId?: string | null;
+      triggerRequest?: {
+        author: string;
+        keyword: string;
+        url: string | null;
+      };
+    } = {},
   ): Promise<{ runId: string; threadId: string | null }> {
     const runId = newId("run");
     const now = Date.now();
@@ -291,6 +327,8 @@ export default async function plugin(bb: BbPluginApi) {
       prTitle: target.title,
       prAuthor: target.author?.login ?? "",
       headSha: target.kind === "pull_request" ? target.headRefOid : "",
+      trigger: options.trigger ?? "manual",
+      triggerEventId: options.triggerEventId ?? null,
       status: "dispatched",
       mode: rule.mode,
       detail:
@@ -314,7 +352,14 @@ export default async function plugin(bb: BbPluginApi) {
     }
 
     const { botGhPath, defaultThreadSection } = await readSettings();
-    const context = { rule, target, runId, ghCommand: botGhPath };
+    const context = {
+      rule,
+      target,
+      runId,
+      ghCommand: botGhPath,
+      trigger: options.trigger,
+      triggerRequest: options.triggerRequest,
+    };
     try {
       // `spawn` takes prompt XOR input. The composer stores its draft under
       // `input`, so it must be dropped here — the prompt SlopCop builds from
@@ -379,6 +424,8 @@ export default async function plugin(bb: BbPluginApi) {
     rule: Rule,
     target: GitHubTarget,
     reason: string,
+    trigger: Trigger,
+    triggerEventId: string | null,
   ): void {
     store.insertRun({
       id: newId("run"),
@@ -390,6 +437,8 @@ export default async function plugin(bb: BbPluginApi) {
       prTitle: target.title,
       prAuthor: target.author?.login ?? "",
       headSha: target.kind === "pull_request" ? target.headRefOid : "",
+      trigger,
+      triggerEventId,
       status: "skipped",
       mode: rule.mode,
       detail: reason,
@@ -398,6 +447,194 @@ export default async function plugin(bb: BbPluginApi) {
       startedAt: Date.now(),
       finishedAt: Date.now(),
     });
+  }
+
+  function triggerEventId(
+    trigger: Trigger,
+    pullRequest: PullRequest,
+    comment?: { source: TriggerCommentSource; commentId: string },
+  ): string {
+    if (comment !== undefined) {
+      return `comment:${comment.source}:${comment.commentId}`;
+    }
+    return `${trigger}:${pullRequest.headRefOid}`;
+  }
+
+  function hasAlreadyRun(
+    rule: Rule,
+    pullRequest: PullRequest,
+    eventId: string,
+  ): boolean {
+    return store.hasRunFor(
+      rule.id,
+      rule.repo,
+      "pull_request",
+      pullRequest.number,
+      rule.dedupe === "once_per_head_sha" ? pullRequest.headRefOid : null,
+      rule.dedupe === "once_per_trigger_event" ? eventId : null,
+    );
+  }
+
+  async function ingestCommentEvents(
+    repo: string,
+    repoRules: Rule[],
+    pullRequests: Map<number, PullRequest>,
+  ): Promise<void> {
+    const commentRules = repoRules.filter((rule) =>
+      rule.triggers.includes("comment_matches"),
+    );
+    if (commentRules.length === 0) return;
+
+    const pollStartedAt = Date.now();
+    const earliestRule = Math.min(
+      ...commentRules.map(
+        (rule) => rule.commentTriggerEnabledAt ?? rule.updatedAt,
+      ),
+    );
+    const sources: TriggerCommentSource[] = ["issue", "review"];
+    for (const source of sources) {
+      const cursor = store.getCommentCursor(repo, source) ?? earliestRule;
+      const since = Math.max(0, cursor - 5_000);
+      try {
+        const comments =
+          source === "issue"
+            ? await gh.listRecentIssueComments(repo, since)
+            : await gh.listRecentReviewComments(repo, since);
+        for (const comment of comments) {
+          if (!pullRequests.has(comment.prNumber)) continue;
+          if (
+            ghLogin !== null &&
+            comment.author?.toLowerCase() === ghLogin.toLowerCase()
+          ) {
+            continue;
+          }
+          for (const rule of commentRules) {
+            // GitHub timestamps have second precision. The one-second margin
+            // keeps a comment made just after rule creation from disappearing.
+            const enabledAt = rule.commentTriggerEnabledAt ?? rule.updatedAt;
+            if (comment.createdAt < enabledAt - 1_000) continue;
+            const keyword = findMatchingKeyword(
+              comment.body,
+              rule.commentKeywords,
+            );
+            if (keyword === null) continue;
+            store.enqueueCommentEvent({
+              ruleId: rule.id,
+              source,
+              commentId: comment.id,
+              repo,
+              prNumber: comment.prNumber,
+              author: comment.author ?? "unknown",
+              authorAssociation: String(comment.authorAssociation),
+              matchedKeyword: keyword,
+              url: comment.url,
+              createdAt: comment.createdAt,
+              status: "pending",
+              detail: null,
+            });
+          }
+        }
+        store.setCommentCursor(repo, source, pollStartedAt);
+      } catch (error) {
+        bb.log.warn(
+          `comment poll failed for ${repo} (${source}): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+  }
+
+  async function processCommentEvents(
+    repo: string,
+    repoRules: Rule[],
+    pullRequests: Map<number, PullRequest>,
+    maxConcurrent: number,
+  ): Promise<void> {
+    for (const event of store.listPendingCommentEvents(repo)) {
+      const rule = repoRules.find((candidate) => candidate.id === event.ruleId);
+      const pullRequest = pullRequests.get(event.prNumber);
+      if (rule === undefined || pullRequest === undefined) {
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          rule === undefined ? "rule is no longer enabled" : "PR is not open",
+        );
+        continue;
+      }
+
+      const eventId = triggerEventId("comment_matches", pullRequest, event);
+      if (!isTrustedAuthor(event.authorAssociation, rule.requesterTrust)) {
+        const reason = `requester @${event.author} is ${event.authorAssociation}, and this rule only accepts ${describeTrust(rule.requesterTrust)}`;
+        recordSkip(rule, pullRequest, reason, "comment_matches", eventId);
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          reason,
+        );
+        announce();
+        continue;
+      }
+
+      await hydrateFiles([rule], repo, pullRequest);
+      // A trusted requester can ask for a review on another person's PR. The
+      // requester gate above replaces the PR-author gate for this trigger.
+      const result = evaluateRule(rule, pullRequest, "comment_matches", {
+        skipAuthorTrust: true,
+      });
+      if (!result.matched) {
+        if (result.blockedByTrust) {
+          recordSkip(
+            rule,
+            pullRequest,
+            result.reason,
+            "comment_matches",
+            eventId,
+          );
+          announce();
+        }
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "ignored",
+          result.reason,
+        );
+        continue;
+      }
+      if (hasAlreadyRun(rule, pullRequest, eventId)) {
+        store.finishCommentEvent(
+          event.ruleId,
+          event.source,
+          event.commentId,
+          "processed",
+          "dedupe policy already matched a run",
+        );
+        continue;
+      }
+      if (inFlight >= maxConcurrent) return;
+
+      await dispatch(rule, pullRequest, {
+        trigger: "comment_matches",
+        triggerEventId: eventId,
+        triggerRequest: {
+          author: event.author,
+          keyword: event.matchedKeyword,
+          url: event.url,
+        },
+      });
+      store.finishCommentEvent(
+        event.ruleId,
+        event.source,
+        event.commentId,
+        "processed",
+        null,
+      );
+    }
   }
 
   /**
@@ -413,7 +650,10 @@ export default async function plugin(bb: BbPluginApi) {
       const pullRequestRules = repoRules.filter((rule) =>
         rule.triggers.some(
           (trigger) =>
-            trigger === "ready_for_review" || trigger === "new_commits",
+            trigger === "ready_for_review" ||
+            trigger === "new_commits" ||
+            trigger === "pr_description_matches" ||
+            trigger === "comment_matches",
         ),
       );
       const issueRules = repoRules.filter((rule) =>
@@ -430,49 +670,86 @@ export default async function plugin(bb: BbPluginApi) {
             );
           }
 
+          const pullRequestsByNumber = new Map(
+            pullRequests.map((pullRequest) => [
+              pullRequest.number,
+              pullRequest,
+            ]),
+          );
+          await ingestCommentEvents(repo, repoRules, pullRequestsByNumber);
+          await processCommentEvents(
+            repo,
+            repoRules,
+            pullRequestsByNumber,
+            maxConcurrent,
+          );
+
           for (const pullRequest of pullRequests) {
-            const triggers: Trigger[] = computeTriggers({
+            const lifecycleTriggers = computeTriggers({
               seen: store.getSeen(repo, pullRequest.number),
               isDraft: pullRequest.isDraft,
               headSha: pullRequest.headRefOid,
               repoBootstrapped,
+              createdAt: pullRequest.createdAt,
+              watchStartedAt: Math.min(
+                ...pullRequestRules.map((rule) => rule.createdAt),
+              ),
             });
-            let retry = false;
-            if (triggers.length > 0) {
-              await hydrateFiles(pullRequestRules, repo, pullRequest);
-              for (const rule of pullRequestRules) {
-                for (const trigger of triggers) {
-                  const result = evaluateRule(rule, pullRequest, trigger);
-                  if (!result.matched) {
-                    if (result.blockedByTrust) {
-                      recordSkip(rule, pullRequest, result.reason);
-                      announce();
-                    }
-                    continue;
-                  }
-                  const alreadyRan = store.hasRunFor(
-                    rule.id,
-                    repo,
-                    "pull_request",
-                    pullRequest.number,
-                    rule.dedupe === "once_per_head_sha"
-                      ? pullRequest.headRefOid
-                      : null,
-                  );
-                  if (alreadyRan) continue;
-                  if (inFlight >= maxConcurrent) {
-                    retry = true;
-                    bb.log.info(
-                      `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+            if (lifecycleTriggers.length === 0) {
+              store.markSeen(
+                repo,
+                pullRequest.number,
+                pullRequest.headRefOid,
+                pullRequest.isDraft,
+                Date.now(),
+              );
+              continue;
+            }
+
+            await hydrateFiles(pullRequestRules, repo, pullRequest);
+            let deferred = false;
+            for (const rule of pullRequestRules) {
+              const triggers = lifecycleTriggers.slice();
+              if (
+                lifecycleTriggers.includes("ready_for_review") &&
+                matchesPrDescription(rule, pullRequest)
+              ) {
+                triggers.push("pr_description_matches");
+              }
+              for (const trigger of triggers) {
+                const result = evaluateRule(rule, pullRequest, trigger);
+                if (!result.matched) {
+                  if (result.blockedByTrust) {
+                    const eventId = triggerEventId(trigger, pullRequest);
+                    recordSkip(
+                      rule,
+                      pullRequest,
+                      result.reason,
+                      trigger,
+                      eventId,
                     );
-                    continue;
+                    announce();
                   }
-                  await dispatch(rule, pullRequest);
+                  continue;
+                }
+                const eventId = triggerEventId(trigger, pullRequest);
+                if (hasAlreadyRun(rule, pullRequest, eventId)) continue;
+                if (inFlight >= maxConcurrent) {
+                  bb.log.info(
+                    `concurrency cap reached (${maxConcurrent}); ${rule.name} will retry next poll`,
+                  );
+                  deferred = true;
                   break;
                 }
+                await dispatch(rule, pullRequest, {
+                  trigger,
+                  triggerEventId: eventId,
+                });
+                break;
               }
+              if (deferred) break;
             }
-            if (!retry) {
+            if (!deferred) {
               store.markSeen(
                 repo,
                 pullRequest.number,
@@ -517,7 +794,7 @@ export default async function plugin(bb: BbPluginApi) {
               const result = evaluateRule(rule, issue, triggers[0]!);
               if (!result.matched) {
                 if (result.blockedByTrust) {
-                  recordSkip(rule, issue, result.reason);
+                  recordSkip(rule, issue, result.reason, "new_issue", null);
                   announce();
                 }
                 continue;
@@ -537,7 +814,7 @@ export default async function plugin(bb: BbPluginApi) {
                 );
                 continue;
               }
-              await dispatch(rule, issue);
+              await dispatch(rule, issue, { trigger: "new_issue" });
             }
             if (!retry) store.markIssueSeen(repo, issue.number, Date.now());
           }
@@ -637,7 +914,11 @@ export default async function plugin(bb: BbPluginApi) {
       } as never)) as { events?: unknown[] };
       const events = Array.isArray(result.events) ? result.events : [];
       for (const raw of [...events].reverse()) {
-        const event = raw as { type?: unknown; message?: unknown; error?: unknown };
+        const event = raw as {
+          type?: unknown;
+          message?: unknown;
+          error?: unknown;
+        };
         const type = typeof event.type === "string" ? event.type : "";
         if (!type.includes("error")) continue;
         const message =
@@ -701,11 +982,20 @@ export default async function plugin(bb: BbPluginApi) {
   ): Rule {
     const now = Date.now();
     const existing = id === null ? null : store.getRule(id);
+    const hadCommentTrigger =
+      (existing?.triggers.includes("comment_matches") ?? false) &&
+      existing?.repo === input.repo;
+    const hasCommentTrigger = input.triggers.includes("comment_matches");
     const rule: Rule = {
       id: existing?.id ?? newId("rule"),
       createdAt: existing?.createdAt ?? now,
       updatedAt: now,
       ...input,
+      commentTriggerEnabledAt: hasCommentTrigger
+        ? hadCommentTrigger
+          ? (existing?.commentTriggerEnabledAt ?? now)
+          : now
+        : null,
     };
     store.upsertRule(rule);
     if (isDangerousCombination(rule)) {
@@ -732,7 +1022,16 @@ export default async function plugin(bb: BbPluginApi) {
     setRuleEnabled: ({ id, enabled }) => {
       const rule = store.getRule(id);
       if (rule === null) throw new Error("rule not found");
-      store.upsertRule({ ...rule, enabled, updatedAt: Date.now() });
+      const now = Date.now();
+      store.upsertRule({
+        ...rule,
+        enabled,
+        updatedAt: now,
+        commentTriggerEnabledAt:
+          enabled && !rule.enabled && rule.triggers.includes("comment_matches")
+            ? now
+            : rule.commentTriggerEnabledAt,
+      });
       announce();
       return { ok: true };
     },
@@ -807,7 +1106,7 @@ export default async function plugin(bb: BbPluginApi) {
         name: "rules-add",
         summary: "Create a rule",
         usage:
-          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--model <m>] [--provider <p>] [--permission <mode>] [--prompt <text>] [--paths <glob,…>] [--base <branch>] [--label <l>] [--skip-label <l>] [--trust write_access|past_contributors|anyone] [--live] [--hidden]",
+          "bb slopcop rules add --name <n> --repo <owner/repo> --project <name> [--trigger <type,…>] [--keyword <text,…>] [--requester-trust <level>] [--trust <level>] [--live] [--hidden]",
       },
       {
         name: "rules-edit",
@@ -947,6 +1246,11 @@ export default async function plugin(bb: BbPluginApi) {
             conditions.push({ kind: "missing_label", labels: skipLabel });
           }
 
+          const parsedTriggers = list("trigger") ??
+            existing?.triggers ?? ["ready_for_review"];
+          const keywordTrigger = parsedTriggers.some((trigger) =>
+            ["comment_matches", "pr_description_matches"].includes(trigger),
+          );
           const parsed = ruleInputSchema.parse({
             name: flag("name") ?? existing?.name,
             repo: flag("repo") ?? existing?.repo,
@@ -956,14 +1260,21 @@ export default async function plugin(bb: BbPluginApi) {
               : has("shadow")
                 ? "shadow"
                 : (existing?.mode ?? "shadow"),
-            triggers: list("trigger") ??
-              existing?.triggers ?? ["ready_for_review"],
+            triggers: parsedTriggers,
+            commentKeywords: list("keyword") ?? existing?.commentKeywords ?? [],
             conditions,
             authorTrust:
               flag("trust") ?? existing?.authorTrust ?? "write_access",
+            requesterTrust:
+              flag("requester-trust") ??
+              existing?.requesterTrust ??
+              "write_access",
             prompt: flag("prompt") ?? existing?.prompt ?? "",
             request: existing?.request ?? null,
-            dedupe: flag("dedupe") ?? existing?.dedupe ?? "once_per_pr",
+            dedupe:
+              flag("dedupe") ??
+              existing?.dedupe ??
+              (keywordTrigger ? "once_per_trigger_event" : "once_per_pr"),
             reviewStrategy:
               flag("strategy") ?? existing?.reviewStrategy ?? "update",
             visibility: has("hidden")
@@ -996,7 +1307,8 @@ export default async function plugin(bb: BbPluginApi) {
             request = {
               ...previous,
               projectId: project?.id ?? (previous.projectId as string),
-              providerId: flag("provider") ?? previous.providerId ?? "claude-code",
+              providerId:
+                flag("provider") ?? previous.providerId ?? "claude-code",
               model: flag("model") ?? previous.model ?? "claude-opus-5",
               reasoningLevel:
                 flag("reasoning") ?? previous.reasoningLevel ?? "high",
@@ -1041,10 +1353,18 @@ export default async function plugin(bb: BbPluginApi) {
             announce();
             return ok(`Deleted '${rule.name}'.`);
           }
+          const now = Date.now();
+          const enabled = sub === "enable";
           store.upsertRule({
             ...rule,
-            enabled: sub === "enable",
-            updatedAt: Date.now(),
+            enabled,
+            updatedAt: now,
+            commentTriggerEnabledAt:
+              enabled &&
+              !rule.enabled &&
+              rule.triggers.includes("comment_matches")
+                ? now
+                : rule.commentTriggerEnabledAt,
           });
           announce();
           return ok(
@@ -1128,7 +1448,9 @@ export default async function plugin(bb: BbPluginApi) {
             .map(
               (comment) =>
                 `\n--- ${comment.kind}${
-                  comment.path === null ? "" : ` ${comment.path}:${comment.line ?? ""}`
+                  comment.path === null
+                    ? ""
+                    : ` ${comment.path}:${comment.line ?? ""}`
                 } [${comment.attribution}]${comment.url === null ? "" : ` ${comment.url}`} ---\n${comment.bodyExcerpt}`,
             )
             .join("\n");
