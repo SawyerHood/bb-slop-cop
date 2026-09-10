@@ -1,3 +1,5 @@
+> **Moved:** this plugin now lives in [sawyer-plugins](https://github.com/SawyerHood/sawyer-plugins/tree/main/plugins/slopcop). This repository is archived and no longer receives updates.
+
 # 🚨 SlopCop
 
 A [BB](https://github.com/ymichael/bb) plugin that handles new GitHub issues and reviews pull requests.
